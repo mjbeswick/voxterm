@@ -40,6 +40,7 @@ struct Config {
     mute_on_blur: bool,
     echo_gate: bool,
     echo_tail_ms: u64,
+    mic_min_rms: f32,
 }
 
 impl Default for Config {
@@ -51,6 +52,7 @@ impl Default for Config {
             mute_on_blur: true,
             echo_gate: true,
             echo_tail_ms: 600,
+            mic_min_rms: 0.0,
         }
     }
 }
@@ -331,6 +333,7 @@ impl App {
                 _ => self.agent_log.push(format!("· {t}")),
             },
             AgentEvent::Tool(s) => self.agent_log.push(format!("[{s}]")),
+            AgentEvent::Info(s) => self.agent_log.push(s),
             AgentEvent::Permission {
                 rpc_id,
                 title,
@@ -414,6 +417,7 @@ impl App {
             KeyCode::F(3) => self.open_picker(PickKind::Voice),
             KeyCode::F(4) => self.open_picker(PickKind::LiveModel),
             KeyCode::F(5) => self.open_picker(PickKind::AgentModel),
+            KeyCode::F(7) => self.save_transcript(),
             KeyCode::F(6) => {
                 self.cfg.mute_on_blur = !self.cfg.mute_on_blur;
                 self.cfg.save();
@@ -437,6 +441,28 @@ impl App {
             KeyCode::Esc => self.input.clear(),
             KeyCode::Char(c) if !ctrl => self.input.push(c),
             _ => {}
+        }
+    }
+
+    /// Writes conversation and agent log to ./voxterm-<unix-time>.md in the working directory.
+    fn save_transcript(&mut self) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join(format!("voxterm-{stamp}.md"));
+        let mut out = String::from("# voxterm transcript\n\n## Conversation\n\n");
+        for e in &self.transcript {
+            out.push_str(&format!("- **{}:** {}\n", e.who, e.text));
+        }
+        out.push_str("\n## Agent\n\n```\n");
+        out.push_str(&self.agent_log.join("\n"));
+        out.push_str("\n```\n");
+        match std::fs::write(&path, out) {
+            Ok(()) => self.sys(format!("saved {}", path.display())),
+            Err(e) => self.sys(format!("save failed: {e}")),
         }
     }
 
@@ -633,7 +659,7 @@ fn draw(f: &mut Frame, app: &App) {
         input.y + 1,
     ));
     f.render_widget(
-        Paragraph::new(" F2 mic · F3 voice · F4 live model · F5 agent model · F6 mute on blur · ctrl-c cancel/quit ").style(Style::new().dark_gray()),
+        Paragraph::new(" F2 mic · F3 voice · F4 live model · F5 agent model · F6 mute on blur · F7 save · ctrl-c cancel/quit ").style(Style::new().dark_gray()),
         hint,
     );
 
@@ -694,7 +720,7 @@ async fn main() -> Result<()> {
     let gate = cfg
         .echo_gate
         .then(|| Duration::from_millis(cfg.echo_tail_ms));
-    let audio_tx = audio::spawn(live_tx.clone(), err_tx.clone(), gate);
+    let audio_tx = audio::spawn(live_tx.clone(), err_tx.clone(), gate, cfg.mic_min_rms);
 
     let (agent_ev_tx, agent_ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
     forward(agent_ev_rx, ui_tx.clone(), Ui::Agent);

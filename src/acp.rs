@@ -27,6 +27,7 @@ pub enum AgentEvent {
         text: String,
     },
     Error(String),
+    Info(String),
 }
 
 #[derive(Debug)]
@@ -204,9 +205,10 @@ pub async fn start(
                                     let _ = events.send(AgentEvent::Done { stop, text: std::mem::take(&mut text) });
                                 }
                             },
-                            Some(Pending::Config) => {
-                                if let Some(e) = err { let _ = events.send(AgentEvent::Error(e)); }
-                            }
+                            Some(Pending::Config) => match err {
+                                Some(e) => { let _ = events.send(AgentEvent::Error(format!("model change failed: {e}"))); }
+                                None => { let _ = events.send(AgentEvent::Info("agent model set".into())); }
+                            },
                             Some(Pending::Init) | None => {}
                         }
                     }

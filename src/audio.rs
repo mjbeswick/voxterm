@@ -24,6 +24,13 @@ struct Shared {
     last_active: Option<Instant>,
 }
 
+pub fn rms(x: &[f32]) -> f32 {
+    if x.is_empty() {
+        return 0.0;
+    }
+    (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+}
+
 /// Streaming linear resampler. Keeps state across chunks.
 pub struct Resampler {
     step: f64,
@@ -66,6 +73,7 @@ pub fn spawn(
     live: UnboundedSender<LiveCmd>,
     errs: UnboundedSender<String>,
     gate: Option<Duration>,
+    min_rms: f32,
 ) -> mpsc::Sender<AudioCmd> {
     let (tx, rx) = mpsc::channel::<AudioCmd>();
     std::thread::spawn(move || {
@@ -84,7 +92,14 @@ pub fn spawn(
             match cmd {
                 AudioCmd::Mic(true) => {
                     if mic.is_none() {
-                        match input(&host, live.clone(), errs.clone(), shared.clone(), gate) {
+                        match input(
+                            &host,
+                            live.clone(),
+                            errs.clone(),
+                            shared.clone(),
+                            gate,
+                            min_rms,
+                        ) {
                             Ok(s) => {
                                 crate::dbg("audio: mic stream open");
                                 mic = Some(s)
@@ -160,6 +175,7 @@ fn input(
     errs: UnboundedSender<String>,
     shared: Arc<Mutex<Shared>>,
     gate: Option<Duration>,
+    min_rms: f32,
 ) -> Result<cpal::Stream> {
     let dev = host
         .default_input_device()
@@ -207,6 +223,13 @@ fn input(
                 buf.clear();
                 return;
             }
+            // Mic level gate: drop chunks quieter than mic_min_rms. Tune with VOXTERM_LOG output.
+            let level = rms(&out);
+            crate::dbg(format!("mic rms {level:.4}"));
+            if level < min_rms {
+                buf.clear();
+                return;
+            }
             buf.extend(out.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
             if buf.len() >= 1600 {
                 let _ = live.send(LiveCmd::Audio(std::mem::take(&mut buf)));
@@ -224,6 +247,12 @@ fn input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rms_of_constant_and_silence() {
+        assert!((rms(&[0.5; 100]) - 0.5).abs() < 1e-6);
+        assert_eq!(rms(&[]), 0.0);
+    }
 
     #[test]
     fn resample_48k_to_16k_length_and_level() {

@@ -19,6 +19,8 @@ Requires `opencode` on your PATH. Run `opencode acp` once yourself to check it s
 
 Headless check: `voxterm --selftest` runs an agent prompt and a Live request.
 
+Barge-in test (network, macOS `say`): `cargo test barge_in -- --ignored --nocapture`.
+
 Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and playback.
 
 ## Keys
@@ -31,6 +33,7 @@ Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and 
 | F4 | Live model picker |
 | F5 | Agent model picker |
 | F6 | Toggle mute on blur |
+| F7 | Save transcript to `voxterm-<time>.md` in the working directory |
 | y / n | Approve or deny a permission request |
 | ctrl-c | Cancel the agent. Quits when the agent is idle |
 | ctrl-q | Quit |
@@ -38,9 +41,11 @@ Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and 
 ## Behavior
 
 - **Mute on blur** drops the mic stream when the terminal loses focus. This turns off the macOS mic indicator.
-- **Echo gate** stops the mic from sending while the assistant speaks. Barge-in works only with headphones.
+- **Echo gate** (`echo_gate`, default on) stops the mic from sending while the assistant speaks. This also blocks barge-in. With headphones, set `echo_gate` to `false` to interrupt the assistant by speaking.
+- **Mic level gate** (`mic_min_rms`, default 0) drops mic chunks quieter than this RMS. Set it from the `mic rms` values in `VOXTERM_LOG`. Room noise in testing read about 0.02 RMS. Speech is louder.
 - **Voice approvals** cover file edits only. Shell and other actions need a screen confirm.
 - **Settings** live in `~/.config/voxterm/config.json`.
+- **Agent model** picks apply to the current session only. A restart uses the agent's default.
 - Changing voice or Live model reconnects the assistant. The conversation context resets.
 
 ## Known limits

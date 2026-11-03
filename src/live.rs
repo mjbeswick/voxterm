@@ -291,3 +291,98 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod barge_in {
+    use super::*;
+    use std::time::Duration;
+
+    /// Mono PCM16 samples from a WAV file, read from its data chunk.
+    fn wav_pcm(bytes: &[u8]) -> Vec<i16> {
+        let at = bytes
+            .windows(4)
+            .position(|w| w == b"data")
+            .expect("data chunk")
+            + 8;
+        bytes[at..]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    /// Needs network, GEMINI_API_KEY, and macOS `say` and `afconvert`.
+    /// Run with: cargo test barge_in -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn barge_in_interrupts_model_speech() {
+        let key = std::env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY");
+        let dir = std::env::temp_dir().join("voxterm-barge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (aiff, wav) = (dir.join("user.aiff"), dir.join("user.wav"));
+        let say = std::process::Command::new("say")
+            .arg("-o")
+            .arg(&aiff)
+            .arg("Stop. Forget the story. Tell me a joke instead.")
+            .status()
+            .unwrap();
+        assert!(say.success());
+        let conv = std::process::Command::new("afconvert")
+            .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
+            .arg(&aiff)
+            .arg(&wav)
+            .status()
+            .unwrap();
+        assert!(conv.success());
+        let speech = wav_pcm(&std::fs::read(&wav).unwrap());
+
+        let settings = Settings {
+            model: "gemini-3.1-flash-live-preview".into(),
+            voice: "Kore".into(),
+        };
+        let ws = connect(&key, &settings).await.unwrap();
+        let (mut tx, mut rx) = ws.split();
+        let ask = encode(&LiveCmd::Text(
+            "Tell me a long story about a lighthouse keeper.".into(),
+        ))
+        .unwrap();
+        tx.send(Message::Text(ask.to_string().into()))
+            .await
+            .unwrap();
+
+        let mut chunks = speech.chunks(1600);
+        let mut pace = tokio::time::interval(Duration::from_millis(100));
+        let (mut model_audio, mut sent, mut interrupted) = (0usize, 0usize, false);
+        let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                tokio::select! {
+                    m = rx.next() => {
+                        let Some(Ok(m)) = m else { panic!("socket closed") };
+                        let Some(v) = parse(&m) else { continue };
+                        for e in handle(&v) {
+                            match e {
+                                LiveEvent::Audio(s) => model_audio += s.len(),
+                                LiveEvent::Interrupted => { interrupted = true; return; }
+                                LiveEvent::TurnComplete => return,
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ = pace.tick(), if model_audio > 0 => {
+                        if let Some(c) = chunks.next() {
+                            sent += 1;
+                            let msg = encode(&LiveCmd::Audio(c.to_vec())).unwrap();
+                            tx.send(Message::Text(msg.to_string().into())).await.unwrap();
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        println!(
+            "model audio samples before barge-in: {model_audio}, speech chunks sent: {sent}, interrupted: {interrupted}"
+        );
+        assert!(outcome.is_ok(), "timed out");
+        assert!(sent > 0, "model never started speaking");
+        assert!(interrupted, "Live did not report interruption");
+    }
+}
