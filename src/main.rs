@@ -38,7 +38,7 @@ struct Config {
     live_model: String,
     agent_cmd: String,
     mute_on_blur: bool,
-    echo_gate: bool,
+    echo_gate: Option<bool>,
     echo_tail_ms: u64,
     mic_min_rms: f32,
 }
@@ -50,7 +50,7 @@ impl Default for Config {
             live_model: "gemini-3.1-flash-live-preview".into(),
             agent_cmd: "opencode acp".into(),
             mute_on_blur: true,
-            echo_gate: true,
+            echo_gate: None,
             echo_tail_ms: 600,
             mic_min_rms: 0.0,
         }
@@ -96,7 +96,11 @@ pub fn dbg(msg: impl AsRef<str>) {
             .append(true)
             .open(path)
         {
-            let _ = writeln!(f, "{}", msg.as_ref());
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = writeln!(f, "{} {}", ms % 100_000_000, msg.as_ref());
         }
     }
 }
@@ -251,6 +255,7 @@ impl App {
             LiveEvent::User(t) => self.push_text("you", &t),
             LiveEvent::Assistant(t) => self.push_text("asst", &t),
             LiveEvent::Interrupted => {
+                dbg("interrupted: flush playback");
                 let _ = self.audio_tx.send(AudioCmd::Flush);
                 self.close_open();
             }
@@ -717,10 +722,13 @@ async fn main() -> Result<()> {
 
     let (err_tx, err_rx) = mpsc::unbounded_channel::<String>();
     forward(err_rx, ui_tx.clone(), Ui::Status);
-    let gate = cfg
-        .echo_gate
-        .then(|| Duration::from_millis(cfg.echo_tail_ms));
-    let audio_tx = audio::spawn(live_tx.clone(), err_tx.clone(), gate, cfg.mic_min_rms);
+    let audio_tx = audio::spawn(
+        live_tx.clone(),
+        err_tx.clone(),
+        cfg.echo_gate,
+        Duration::from_millis(cfg.echo_tail_ms),
+        cfg.mic_min_rms,
+    );
 
     let (agent_ev_tx, agent_ev_rx) = mpsc::unbounded_channel::<AgentEvent>();
     forward(agent_ev_rx, ui_tx.clone(), Ui::Agent);

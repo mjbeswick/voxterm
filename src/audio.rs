@@ -72,20 +72,25 @@ impl Resampler {
 pub fn spawn(
     live: UnboundedSender<LiveCmd>,
     errs: UnboundedSender<String>,
-    gate: Option<Duration>,
+    echo: Option<bool>,
+    echo_tail: Duration,
     min_rms: f32,
 ) -> mpsc::Sender<AudioCmd> {
     let (tx, rx) = mpsc::channel::<AudioCmd>();
     std::thread::spawn(move || {
         let host = cpal::default_host();
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let (_out, out_rate) = match output(&host, shared.clone(), errs.clone()) {
+        let (_out, out_rate, out_name) = match output(&host, shared.clone(), errs.clone()) {
             Ok(v) => v,
             Err(e) => {
                 let _ = errs.send(format!("speaker: {e}"));
                 return;
             }
         };
+        // Auto: gate when the output looks like built-in speakers, where speaker sound re-enters the mic.
+        let gate_on = echo.unwrap_or_else(|| out_name.to_lowercase().contains("speaker"));
+        let gate = gate_on.then_some(echo_tail);
+        crate::dbg(format!("audio: output '{out_name}', echo gate {gate_on}"));
         let mut play_rs = Resampler::new(24_000, out_rate);
         let mut mic: Option<cpal::Stream> = None;
         while let Ok(cmd) = rx.recv() {
@@ -131,7 +136,7 @@ fn output(
     host: &cpal::Host,
     shared: Arc<Mutex<Shared>>,
     errs: UnboundedSender<String>,
-) -> Result<(cpal::Stream, u32)> {
+) -> Result<(cpal::Stream, u32, String)> {
     let dev = host
         .default_output_device()
         .ok_or_else(|| anyhow!("no output device"))?;
@@ -166,7 +171,13 @@ fn output(
     )?;
     stream.play()?;
     crate::dbg(format!("audio: speaker open at {rate} Hz, {ch} ch"));
-    Ok((stream, rate))
+    Ok((
+        stream,
+        rate,
+        dev.description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_default(),
+    ))
 }
 
 fn input(
@@ -216,8 +227,10 @@ fn input(
             // Echo gate: while the assistant speaks, do not send the speaker's sound back as input.
             let busy = {
                 let sh = shared.lock().unwrap();
-                !sh.queue.is_empty()
-                    || gate.is_some_and(|g| sh.last_active.is_some_and(|t| t.elapsed() < g))
+                // Gate off means never busy, so barge-in always reaches Live.
+                gate.is_some_and(|g| {
+                    !sh.queue.is_empty() || sh.last_active.is_some_and(|t| t.elapsed() < g)
+                })
             };
             if busy {
                 buf.clear();

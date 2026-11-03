@@ -41,7 +41,9 @@ Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and 
 ## Behavior
 
 - **Mute on blur** drops the mic stream when the terminal loses focus. This turns off the macOS mic indicator.
-- **Echo gate** (`echo_gate`, default on) stops the mic from sending while the assistant speaks. This also blocks barge-in. With headphones, set `echo_gate` to `false` to interrupt the assistant by speaking.
+- **Echo gate** (`echo_gate`, default auto). Auto turns the gate on when the output device name contains "speaker". The gate stops the mic from sending while the assistant speaks. It also blocks barge-in.
+- **Barge-in** works with headphones or any output not named "speaker". Built-in speakers need the gate on, so they cannot interrupt the assistant until echo cancellation exists.
+- **Ambient speech** from a TV or people nearby can start a turn. Headphones help. Use `mic_min_rms` to reject quiet room noise.
 - **Mic level gate** (`mic_min_rms`, default 0) drops mic chunks quieter than this RMS. Set it from the `mic rms` values in `VOXTERM_LOG`. Room noise in testing read about 0.02 RMS. Speech is louder.
 - **Voice approvals** cover file edits only. Shell and other actions need a screen confirm.
 - **Settings** live in `~/.config/voxterm/config.json`.
