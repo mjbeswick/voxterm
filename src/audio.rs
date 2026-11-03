@@ -85,16 +85,23 @@ pub fn spawn(
                 AudioCmd::Mic(true) => {
                     if mic.is_none() {
                         match input(&host, live.clone(), errs.clone(), shared.clone(), gate) {
-                            Ok(s) => mic = Some(s),
+                            Ok(s) => {
+                                crate::dbg("audio: mic stream open");
+                                mic = Some(s)
+                            }
                             Err(e) => {
                                 let _ = errs.send(format!("mic: {e}"));
                             }
                         }
                     }
                 }
-                AudioCmd::Mic(false) => mic = None,
+                AudioCmd::Mic(false) => {
+                    crate::dbg("audio: mic stream dropped");
+                    mic = None
+                }
                 AudioCmd::Play(samples) => {
                     let f: Vec<f32> = samples.iter().map(|x| *x as f32 / 32768.0).collect();
+                    crate::dbg(format!("audio: play {} samples", f.len()));
                     let out = play_rs.process(&f);
                     shared.lock().unwrap().queue.extend(out);
                 }
@@ -143,6 +150,7 @@ fn output(
         None,
     )?;
     stream.play()?;
+    crate::dbg(format!("audio: speaker open at {rate} Hz, {ch} ch"));
     Ok((stream, rate))
 }
 

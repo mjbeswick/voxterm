@@ -106,6 +106,7 @@ pub async fn start(
         };
         let mut sid = String::new();
         let mut text = String::new();
+        let mut queued: Option<String> = None; // prompt sent before the session was ready
 
         let started = async {
             conn.call(
@@ -174,6 +175,12 @@ pub async fn start(
                         match conn.pending.remove(&id) {
                             Some(Pending::New) => {
                                 sid = v["result"]["sessionId"].as_str().unwrap_or_default().to_string();
+                                if let Some(t) = queued.take() {
+                                    text.clear();
+                                    if conn.call("session/prompt", json!({"sessionId": sid, "prompt": [{"type": "text", "text": t}]}), Pending::Prompt).await.is_err() {
+                                        break;
+                                    }
+                                }
                                 let models = v["result"]["configOptions"]
                                     .as_array()
                                     .into_iter()
@@ -209,7 +216,7 @@ pub async fn start(
                     let r = match cmd {
                         AgentCmd::Prompt(t) => {
                             if sid.is_empty() {
-                                let _ = events.send(AgentEvent::Error("agent session not ready".into()));
+                                queued = Some(t);
                                 Ok(())
                             } else {
                                 text.clear();

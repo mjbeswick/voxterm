@@ -19,6 +19,8 @@ Requires `opencode` on your PATH. Run `opencode acp` once yourself to check it s
 
 Headless check: `voxterm --selftest` runs an agent prompt and a Live request.
 
+Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and playback.
+
 ## Keys
 
 | Key | Action |

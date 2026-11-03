@@ -85,6 +85,20 @@ fn settings_of(c: &Config) -> Settings {
     }
 }
 
+/// Opt-in event log: set VOXTERM_LOG to a file path.
+pub fn dbg(msg: impl AsRef<str>) {
+    if let Ok(path) = std::env::var("VOXTERM_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{}", msg.as_ref());
+        }
+    }
+}
+
 /// Everything the UI loop reacts to, funnelled into one channel.
 enum Ui {
     Live(LiveEvent),
@@ -163,6 +177,12 @@ impl App {
     }
 
     fn apply_mic(&self) {
+        dbg(format!(
+            "mic wanted={} focused={} manual_mute={}",
+            self.mic_wanted(),
+            self.focused,
+            self.manual_mute
+        ));
         let _ = self.audio_tx.send(AudioCmd::Mic(self.mic_wanted()));
     }
 
@@ -199,6 +219,16 @@ impl App {
     }
 
     fn on_ui(&mut self, ev: Ui) {
+        dbg(format!(
+            "ui {}",
+            match &ev {
+                Ui::Live(e) => format!("{e:?}").chars().take(60).collect::<String>(),
+                Ui::Agent(e) => format!("{e:?}").chars().take(60).collect::<String>(),
+                Ui::Status(s) => format!("status {s}"),
+                Ui::Models(m) => format!("models {}", m.len()),
+                Ui::Preview(_) => "preview".into(),
+            }
+        ));
         match ev {
             Ui::Live(e) => self.on_live(e),
             Ui::Agent(e) => self.on_agent(e),
@@ -467,6 +497,7 @@ impl App {
 
     fn apply_pick(&mut self, p: Picker) {
         let (val, _) = p.items[p.sel].clone();
+        dbg(format!("pick {} {}", p.title, val));
         match p.kind {
             PickKind::Voice => {
                 self.cfg.voice = val.clone();
@@ -503,7 +534,10 @@ impl App {
         let text = format!("Hi, I'm {voice}. This is how I sound.");
         tokio::spawn(async move {
             let msg = match live::once(&key, &s, &text).await {
-                Ok(samples) => Ui::Preview(samples),
+                Ok(samples) => {
+                    dbg(format!("preview {} samples", samples.len()));
+                    Ui::Preview(samples)
+                }
                 Err(e) => Ui::Status(format!("preview failed: {e}")),
             };
             let _ = ui.send(msg);
