@@ -11,6 +11,7 @@ The assistant has no file or shell tools. Changes always go through the coding a
 
 ```sh
 export GEMINI_API_KEY=...      # read from the environment only
+brew install meson ninja       # needed to build WebRTC echo cancellation
 cargo install --path .         # installs `voxterm`
 cd your-project && voxterm     # the agent runs in the current directory
 ```
@@ -19,7 +20,7 @@ Requires `opencode` on your PATH. Run `opencode acp` once yourself to check it s
 
 Headless check: `voxterm --selftest` runs an agent prompt and a Live request.
 
-Barge-in test (network, macOS `say`): `cargo test barge_in -- --ignored --nocapture`.
+Live barge-in test (network, macOS `say`): `cargo test barge_in -- --ignored --nocapture`.
 
 Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and playback.
 
@@ -41,9 +42,10 @@ Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and 
 ## Behavior
 
 - **Mute on blur** drops the mic stream when the terminal loses focus. This turns off the macOS mic indicator.
-- **Echo gate** (`echo_gate`, default auto). Auto turns the gate on when the output device name contains "speaker". The gate stops the mic from sending while the assistant speaks. It also blocks barge-in.
-- **Barge-in** works with headphones or any output not named "speaker". Built-in speakers need the gate on, so they cannot interrupt the assistant until echo cancellation exists.
-- **Ambient speech** from a TV or people nearby can start a turn. Headphones help. Use `mic_min_rms` to reject quiet room noise.
+- **Echo cancellation** (WebRTC AudioProcessing) runs on the mic. It cancels the speaker output the app played. Its benefit on built-in speakers is not yet measured.
+- **Echo gate** (`echo_gate`, default off). Set to `true` to block the mic while the assistant speaks. The gate also blocks barge-in.
+- **Barge-in** through the mic is not yet verified end to end. Live interrupts on speech in a test with synthetic speech. The app path through a real mic and speakers is untested.
+- **Ambient speech** from a TV or people nearby starts turns. In testing, the false turns matched TV dialogue, not the assistant's words. Use `mic_min_rms` to reject quiet room noise.
 - **Mic level gate** (`mic_min_rms`, default 0) drops mic chunks quieter than this RMS. Set it from the `mic rms` values in `VOXTERM_LOG`. Room noise in testing read about 0.02 RMS. Speech is louder.
 - **Voice approvals** cover file edits only. Shell and other actions need a screen confirm.
 - **Settings** live in `~/.config/voxterm/config.json`.

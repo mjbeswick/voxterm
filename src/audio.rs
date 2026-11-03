@@ -1,7 +1,9 @@
 //! Audio thread. cpal streams are not Send, so one thread owns them all.
-//! Mic: device rate f32 -> 16 kHz i16 chunks to Live. Dropping the stream releases the mic.
+//! Mic: device rate f32 -> echo cancel (16 kHz) -> i16 chunks to Live. Dropping the stream releases the mic.
 //! Speaker: 24 kHz i16 from Live -> device rate f32, queued and flushed on interrupt.
+//! The speaker output is copied as the echo reference, so the canceller sees what was really played.
 
+use crate::aec::Aec;
 use crate::live::LiveCmd;
 use anyhow::{Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -21,6 +23,8 @@ pub enum AudioCmd {
 #[derive(Default)]
 struct Shared {
     queue: VecDeque<f32>,
+    /// Mono device-rate samples the speaker played. Read by the mic callback as the echo reference.
+    refq: VecDeque<f32>,
     last_active: Option<Instant>,
 }
 
@@ -69,6 +73,8 @@ impl Resampler {
     }
 }
 
+/// `echo`: Some(true) turns on the echo gate, which blocks the mic while the assistant speaks.
+/// None or Some(false) leaves it off. Echo cancellation runs on the mic either way.
 pub fn spawn(
     live: UnboundedSender<LiveCmd>,
     errs: UnboundedSender<String>,
@@ -80,17 +86,18 @@ pub fn spawn(
     std::thread::spawn(move || {
         let host = cpal::default_host();
         let shared = Arc::new(Mutex::new(Shared::default()));
-        let (_out, out_rate, out_name) = match output(&host, shared.clone(), errs.clone()) {
+        let (_out, out_rate) = match output(&host, shared.clone(), errs.clone()) {
             Ok(v) => v,
             Err(e) => {
                 let _ = errs.send(format!("speaker: {e}"));
                 return;
             }
         };
-        // Auto: gate when the output looks like built-in speakers, where speaker sound re-enters the mic.
-        let gate_on = echo.unwrap_or_else(|| out_name.to_lowercase().contains("speaker"));
-        let gate = gate_on.then_some(echo_tail);
-        crate::dbg(format!("audio: output '{out_name}', echo gate {gate_on}"));
+        let gate = echo.unwrap_or(false).then_some(echo_tail);
+        crate::dbg(format!(
+            "audio: speaker {out_rate} Hz, echo gate {}",
+            gate.is_some()
+        ));
         let mut play_rs = Resampler::new(24_000, out_rate);
         let mut mic: Option<cpal::Stream> = None;
         while let Ok(cmd) = rx.recv() {
@@ -102,8 +109,7 @@ pub fn spawn(
                             live.clone(),
                             errs.clone(),
                             shared.clone(),
-                            gate,
-                            min_rms,
+                            (out_rate, gate, min_rms),
                         ) {
                             Ok(s) => {
                                 crate::dbg("audio: mic stream open");
@@ -136,7 +142,7 @@ fn output(
     host: &cpal::Host,
     shared: Arc<Mutex<Shared>>,
     errs: UnboundedSender<String>,
-) -> Result<(cpal::Stream, u32, String)> {
+) -> Result<(cpal::Stream, u32)> {
     let dev = host
         .default_output_device()
         .ok_or_else(|| anyhow!("no output device"))?;
@@ -149,6 +155,8 @@ fn output(
     }
     let rate = cfg.sample_rate();
     let ch = cfg.channels() as usize;
+    // Keep at most one second of reference. The mic callback drains it sooner.
+    let keep = rate as usize;
     let stream = dev.build_output_stream(
         cfg.config(),
         move |data: &mut [f32], _| {
@@ -161,7 +169,11 @@ fn output(
                     }
                     None => 0.0,
                 };
+                sh.refq.push_back(s);
                 frame.iter_mut().for_each(|c| *c = s);
+            }
+            while sh.refq.len() > keep {
+                sh.refq.pop_front();
             }
         },
         move |e| {
@@ -171,13 +183,7 @@ fn output(
     )?;
     stream.play()?;
     crate::dbg(format!("audio: speaker open at {rate} Hz, {ch} ch"));
-    Ok((
-        stream,
-        rate,
-        dev.description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_default(),
-    ))
+    Ok((stream, rate))
 }
 
 fn input(
@@ -185,8 +191,7 @@ fn input(
     live: UnboundedSender<LiveCmd>,
     errs: UnboundedSender<String>,
     shared: Arc<Mutex<Shared>>,
-    gate: Option<Duration>,
-    min_rms: f32,
+    (out_rate, gate, min_rms): (u32, Option<Duration>, f32),
 ) -> Result<cpal::Stream> {
     let dev = host
         .default_input_device()
@@ -199,7 +204,8 @@ fn input(
         ));
     }
     let ch = cfg.channels() as usize;
-    let mut rs = Resampler::new(cfg.sample_rate(), 16_000);
+    let mut aec = Aec::new(out_rate, cfg.sample_rate());
+    crate::dbg(format!("audio: echo cancel active: {}", aec.active()));
     let mut buf: Vec<i16> = Vec::new();
     let mut silent_since: Option<Instant> = None;
     let mut warned = false;
@@ -223,27 +229,26 @@ fn input(
                 silent_since = None;
                 warned = false;
             }
-            let out = rs.process(&mono);
-            // Echo gate: while the assistant speaks, do not send the speaker's sound back as input.
-            let busy = {
-                let sh = shared.lock().unwrap();
-                // Gate off means never busy, so barge-in always reaches Live.
-                gate.is_some_and(|g| {
+            let (refd, busy): (Vec<f32>, bool) = {
+                let mut sh = shared.lock().unwrap();
+                let refd: Vec<f32> = sh.refq.drain(..).collect();
+                let busy = gate.is_some_and(|g| {
                     !sh.queue.is_empty() || sh.last_active.is_some_and(|t| t.elapsed() < g)
-                })
+                });
+                (refd, busy)
             };
-            if busy {
-                buf.clear();
-                return;
-            }
-            // Mic level gate: drop chunks quieter than mic_min_rms. Tune with VOXTERM_LOG output.
-            let level = rms(&out);
+            let cleaned = aec.process(&refd, &mono);
+            let level = rms(&cleaned);
             crate::dbg(format!("mic rms {level:.4}"));
-            if level < min_rms {
+            if busy || level < min_rms {
                 buf.clear();
                 return;
             }
-            buf.extend(out.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
+            buf.extend(
+                cleaned
+                    .iter()
+                    .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16),
+            );
             if buf.len() >= 1600 {
                 let _ = live.send(LiveCmd::Audio(std::mem::take(&mut buf)));
             }
@@ -270,8 +275,8 @@ mod tests {
     #[test]
     fn resample_48k_to_16k_length_and_level() {
         let mut r = Resampler::new(48_000, 16_000);
-        let a = r.process(&vec![0.5; 4800]);
-        let b = r.process(&vec![0.5; 4800]);
+        let a = r.process(&[0.5; 4800]);
+        let b = r.process(&[0.5; 4800]);
         let total = a.len() + b.len();
         assert!((3198..=3202).contains(&total), "got {total}");
         assert!(a.iter().chain(b.iter()).all(|s| (s - 0.5).abs() < 1e-6));

@@ -1,6 +1,7 @@
 //! voxterm: full-screen voice assistant. Gemini Live talks. A coding agent (ACP) changes things.
 
 mod acp;
+mod aec;
 mod audio;
 mod live;
 
