@@ -644,7 +644,7 @@ impl App {
                                 self.theme = i;
                             }
                         }
-                        // The voice applies once the selection has been still for a moment.
+                        // The voice is previewed once the selection has been still for a moment.
                         PickKind::Voice => self.pending_voice = Some((name, Instant::now())),
                         _ => {}
                     }
@@ -656,21 +656,17 @@ impl App {
                     self.apply_picker(p);
                 }
             }
-            KeyCode::Char(' ') if p.kind == PickKind::Voice => {
-                if let Some((v, _)) = p.items.get(p.sel).cloned() {
-                    self.send(json!({"c": "preview", "voice": v}));
-                }
-            }
             _ => {}
         }
     }
 
-    /// Applies a voice once the picker selection has been still for 700 ms.
+    /// Previews a voice once the picker selection has been still for 700 ms.
+    /// Previewing does not reconnect the session, so the conversation is kept.
     pub fn on_tick(&mut self) {
         if let Some((name, at)) = self.pending_voice.clone() {
             if at.elapsed() >= Duration::from_millis(700) {
                 self.pending_voice = None;
-                self.send(json!({"c": "voice", "name": name}));
+                self.send(json!({"c": "preview", "voice": name}));
             }
         }
     }
@@ -1293,10 +1289,7 @@ impl App {
             let list = List::new(items)
                 .block(
                     panel_line(title_line(p.title, None, &t), t.accent, &t).title_bottom(
-                        Line::styled(
-                            " enter apply · esc cancel · space preview ",
-                            Style::new().fg(t.muted),
-                        ),
+                        Line::styled(" enter apply · esc cancel ", Style::new().fg(t.muted)),
                     ),
                 )
                 .highlight_style(Style::new().fg(t.on_accent).bg(t.accent))
