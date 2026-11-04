@@ -115,6 +115,8 @@ pub struct App {
     out_hist: Vec<u64>,
     tick: usize,
     clear_btn: Option<Rect>,
+    /// Header state chip. Clicking it toggles the mic.
+    mic_btn: Option<Rect>,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -156,6 +158,7 @@ impl App {
             out_hist: vec![],
             tick: 0,
             clear_btn: None,
+            mic_btn: None,
         }
     }
 
@@ -390,14 +393,16 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            if let Some(r) = self.clear_btn {
-                let inside = m.column >= r.x
+            let inside = |r: Rect| {
+                m.column >= r.x
                     && m.column < r.x + r.width
                     && m.row >= r.y
-                    && m.row < r.y + r.height;
-                if inside {
-                    self.clear_finished();
-                }
+                    && m.row < r.y + r.height
+            };
+            if self.clear_btn.is_some_and(inside) {
+                self.clear_finished();
+            } else if self.mic_btn.is_some_and(inside) {
+                self.send(json!({"c": "mute", "on": self.status.mic}));
             }
         }
     }
@@ -793,6 +798,8 @@ impl App {
 
         // Header
         let (label, color) = state_style(&self.status.state, &t);
+        let chip_width = label.chars().count() as u16 + 2;
+        self.mic_btn = Some(Rect::new(top.x + 9, top.y, chip_width, 1));
         let header = Line::from(vec![
             Span::styled(
                 " voxterm ",
@@ -1020,10 +1027,10 @@ impl App {
         } else {
             match self.focus {
                 Focus::Tasks => {
-                    "↑↓ select · enter log · ctrl-c cancel · ctrl-o chat · ctrl-l log · ctrl-k commands".into()
+                    "↑↓ select · enter open log · ctrl-c cancel task · ctrl-o chat · ctrl-l log · ctrl-k all commands".into()
                 }
-                Focus::Conversation => "ctrl-a tasks · ctrl-l log · ctrl-t mute · ctrl-k commands".into(),
-                Focus::Input => "enter send · ctrl-a tasks · ctrl-o chat · ctrl-t mute · ctrl-k commands".into(),
+                Focus::Conversation => "ctrl-a tasks · ctrl-l log · ctrl-t mute mic (or click the state) · ctrl-k all commands · ctrl-q quit".into(),
+                Focus::Input => "enter send · ctrl-a tasks · ctrl-o chat · ctrl-t mute mic · ctrl-k all commands · ctrl-q quit".into(),
             }
         };
         f.render_widget(
