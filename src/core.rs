@@ -320,7 +320,10 @@ impl Core {
     }
 
     fn emit_levels(&self) {
-        let (mic, out) = crate::audio::LEVELS.lock().map(|l| *l).unwrap_or((0.0, 0.0));
+        let (mic, out) = crate::audio::LEVELS
+            .lock()
+            .map(|l| *l)
+            .unwrap_or((0.0, 0.0));
         self.emit(json!({"t": "levels", "mic": mic, "out": out}));
     }
 
@@ -400,7 +403,6 @@ impl Core {
             log: vec![],
             perm: None,
         });
-        self.say("sys", &format!("task {id} started: {title}"), false);
         self.emit_tasks();
         match self.worker.clone() {
             None => self.fail_task(id, "tasks are not available".into()),
@@ -425,7 +427,7 @@ impl Core {
             t.status = "failed";
             t.log.push(format!("error: {msg}"));
         }
-        self.say("sys", &format!("task {id} failed: {msg}"), false);
+        self.say("sys", &format!("That change failed: {msg}"), false);
         self.notice(format!("[task {id} failed] {msg}"));
         self.emit_tasks();
     }
@@ -634,7 +636,6 @@ impl Core {
                             options,
                         });
                     }
-                    self.say("sys", &format!("task {id} needs approval: {title}"), false);
                     self.notice(format!(
                         "[task {id} needs approval: {title} ({kind}). Ask the user aloud. Call approve_change if they confirm.]"
                     ));
@@ -650,10 +651,8 @@ impl Core {
                         t.log.push(format!("finished ({stop})"));
                     }
                     if cancelled {
-                        self.say("sys", &format!("task {id} cancelled"), false);
                         self.notice(format!("[task {id} cancelled]"));
                     } else {
-                        self.say("sys", &format!("task {id} finished"), false);
                         let tail = tail_chars(&text, 1500);
                         let msg = if tail.trim().is_empty() {
                             format!("[task {id} finished] no text output")

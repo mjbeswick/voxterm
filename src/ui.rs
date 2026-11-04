@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
+    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -621,6 +621,18 @@ impl App {
     }
 }
 
+/// Eight-step block bar for a 0..=100 level.
+fn level_bar(level: u64, width: usize) -> String {
+    const STEPS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let filled = (level as usize * width * 8) / 100;
+    (0..width)
+        .map(|i| {
+            let cell = filled.saturating_sub(i * 8).min(8);
+            STEPS[cell]
+        })
+        .collect()
+}
+
 fn push_hist(h: &mut Vec<u64>, v: u64) {
     h.push(v);
     if h.len() > 240 {
@@ -699,21 +711,6 @@ fn status_word(s: &str) -> (&str, Color) {
     }
 }
 
-fn draw_levels(f: &mut Frame, area: Rect, mic: &[u64], out: &[u64], t: &Theme) {
-    let block = panel("levels", t.border, t);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let [mic_row, out_row] = Layout::vertical([Constraint::Length(2), Constraint::Length(2)]).areas(inner);
-    let width = inner.width.saturating_sub(7) as usize;
-    let tail = |h: &[u64]| -> Vec<u64> { h.iter().rev().take(width).rev().copied().collect() };
-    let [mic_label, mic_spark] = Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).areas(mic_row);
-    f.render_widget(Paragraph::new("mic    ").style(Style::new().fg(t.dim)), mic_label);
-    f.render_widget(Sparkline::default().data(&tail(mic)).max(100).style(Style::new().fg(t.good)), mic_spark);
-    let [out_label, out_spark] = Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).areas(out_row);
-    f.render_widget(Paragraph::new("speak  ").style(Style::new().fg(t.dim)), out_label);
-    f.render_widget(Sparkline::default().data(&tail(out)).max(100).style(Style::new().fg(t.special)), out_spark);
-}
-
 impl App {
     pub fn draw(&self, f: &mut Frame) {
         let t = self.t();
@@ -783,15 +780,12 @@ impl App {
             .says
             .iter()
             .map(|s| {
-                // Task messages get their own label and colour, apart from the assistant.
-                let is_task = s.who == "sys" && s.text.starts_with("task");
                 let (label, lc) = match s.who.as_str() {
                     "you" => ("you ", t.special),
                     "asst" => ("asst", t.good),
-                    _ if is_task => ("task", t.warn),
                     _ => ("sys ", t.muted),
                 };
-                let tc = if s.who == "sys" && !is_task { t.muted } else { t.fg };
+                let tc = if s.who == "sys" { t.muted } else { t.fg };
                 Line::from(vec![
                     Span::styled(
                         format!("{label}  "),
@@ -803,12 +797,12 @@ impl App {
             .collect();
         pane(f, left, "conversation", says, conv_border, &t);
 
-        let (task_list, log, levels) = if self.log_open {
-            let [a, b, c] = Layout::vertical([Constraint::Min(3), Constraint::Percentage(35), Constraint::Length(5)]).areas(right);
-            (a, b, c)
+        let (task_list, log) = if self.log_open {
+            let [a, b] = Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(right);
+            (a, b)
         } else {
-            let [a, c] = Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).areas(right);
-            (a, Rect::default(), c)
+            (right, Rect::default())
         };
         let task_border = if self.focus == Focus::Tasks {
             t.warn
@@ -839,7 +833,6 @@ impl App {
             ]));
         }
         pane(f, task_list, "tasks", task_lines, task_border, &t);
-        draw_levels(f, levels, &self.mic_hist, &self.out_hist, &t);
         if self.log_open {
             if let Some(task) = self.tasks.get(self.sel_task) {
                 let lines: Vec<Line> = task
@@ -891,9 +884,22 @@ impl App {
         } else {
             t.border
         };
+        let input_block = panel("message · enter sends", input_border, &t);
+        let inner = input_block.inner(input);
+        f.render_widget(input_block, input);
+        // Level bar: the speaker while the assistant talks, otherwise the mic.
+        let (level, bar_color) = if self.status.state == "speaking" {
+            (self.out_hist.last().copied().unwrap_or(0), t.special)
+        } else {
+            (self.mic_hist.last().copied().unwrap_or(0), t.good)
+        };
+        let bar_width = (inner.width / 4).clamp(6, 24);
+        let [text_area, bar_area] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(bar_width)]).areas(inner);
+        f.render_widget(Paragraph::new(prompt), text_area);
         f.render_widget(
-            Paragraph::new(prompt).block(panel("message · enter sends", input_border, &t)),
-            input,
+            Paragraph::new(level_bar(level, bar_width as usize)).style(Style::new().fg(bar_color)),
+            bar_area,
         );
         if self.focus == Focus::Input {
             f.set_cursor_position(Position::new(
