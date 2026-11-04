@@ -13,9 +13,14 @@ use tokio_tungstenite::{
 };
 
 const WS_URL: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-const SYSTEM: &str = "You are voxterm, a voice assistant. Keep spoken replies short. \
-For anything that changes files, runs commands, or touches code, call ask_coding_agent with a complete task. \
-Use googleSearch for facts on the web. When a [coding agent finished] message arrives, summarize it in one or two sentences.";
+const SYSTEM: &str = "You are voxterm. You do the work yourself: you read and change the user's code and files, and you run commands. \
+You do that through tasks. Call start_task with a complete description of the change as soon as the user describes a change, a bug, \
+a refactor, a test, or a command to run. Do not ask permission to start a task. Several tasks can run at once. \
+Use list_tasks and task_status to check on them. Use cancel_task to stop one. \
+When a [task N finished] note arrives, summarize it in one or two sentences. \
+When a [task N needs approval] note arrives, ask the user aloud. Call approve_change with allow=true only after a spoken yes. \
+Never say the words agent, worker, or sub-agent. Say task, or say I. Keep spoken replies short. \
+When the user asks to change a setting, a voice, a model, or the mute state, or to manage tasks, use the matching tool, then confirm the new value aloud. Use googleSearch for facts on the web.";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -55,14 +60,42 @@ pub enum LiveEvent {
 fn tools() -> Value {
     json!([
         {"functionDeclarations": [
-            {"name": "ask_coding_agent", "description": "Give a coding task to the coding agent. It runs in the background. Use for any change to files, code, or commands. Returns immediately; the result arrives later.",
-             "parameters": {"type": "OBJECT", "properties": {"task": {"type": "STRING", "description": "Complete task description"}}, "required": ["task"]}},
-            {"name": "agent_status", "description": "Check whether the coding agent is still working.",
+            {"name": "start_task", "description": "Start a task that makes changes or runs commands in the user's project. It runs in the background. Returns at once.",
+             "parameters": {"type": "OBJECT", "properties": {
+                 "task": {"type": "STRING", "description": "Complete description of the work"},
+                 "title": {"type": "STRING", "description": "Short name shown in the task list"}},
+              "required": ["task"]}},
+            {"name": "list_tasks", "description": "List all tasks and their status.",
              "parameters": {"type": "OBJECT", "properties": {}}},
-            {"name": "cancel_agent", "description": "Stop the coding agent's current task.",
+            {"name": "task_status", "description": "Get one task's status and its latest output.",
+             "parameters": {"type": "OBJECT", "properties": {"task_id": {"type": "INTEGER"}}, "required": ["task_id"]}},
+            {"name": "cancel_task", "description": "Stop a running task.",
+             "parameters": {"type": "OBJECT", "properties": {"task_id": {"type": "INTEGER"}}, "required": ["task_id"]}},
+            {"name": "approve_change", "description": "Allow or deny a task's pending change. Voice may only approve file edits. Other actions need the user's screen confirmation.",
+             "parameters": {"type": "OBJECT", "properties": {
+                 "task_id": {"type": "INTEGER"},
+                 "allow": {"type": "BOOLEAN"}},
+              "required": ["task_id", "allow"]}}
+        ]},
+        {"functionDeclarations": [
+            {"name": "set_voice", "description": "Change the spoken voice. The live session reconnects.",
+             "parameters": {"type": "OBJECT", "properties": {"voice": {"type": "STRING", "enum": ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"]}}, "required": ["voice"]}},
+            {"name": "preview_voice", "description": "Play a short sample in a voice so the user can hear it.",
+             "parameters": {"type": "OBJECT", "properties": {"voice": {"type": "STRING", "enum": ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"]}}, "required": ["voice"]}},
+            {"name": "set_live_model", "description": "Change the voice model. The live session reconnects.",
+             "parameters": {"type": "OBJECT", "properties": {"model": {"type": "STRING"}}, "required": ["model"]}},
+            {"name": "set_mute", "description": "Mute or unmute the microphone.",
+             "parameters": {"type": "OBJECT", "properties": {"muted": {"type": "BOOLEAN"}}, "required": ["muted"]}},
+            {"name": "set_mute_on_blur", "description": "Turn mute-when-unfocused on or off.",
+             "parameters": {"type": "OBJECT", "properties": {"on": {"type": "BOOLEAN"}}, "required": ["on"]}},
+            {"name": "get_settings", "description": "Read the current voice, model, and mute settings.",
              "parameters": {"type": "OBJECT", "properties": {}}},
-            {"name": "answer_permission", "description": "Approve or deny the agent's pending action. Voice may only approve file edits; other actions need the user's screen confirmation.",
-             "parameters": {"type": "OBJECT", "properties": {"allow": {"type": "BOOLEAN"}}, "required": ["allow"]}}
+            {"name": "cancel_all_tasks", "description": "Stop every running task.",
+             "parameters": {"type": "OBJECT", "properties": {}}},
+            {"name": "save_transcript", "description": "Save the conversation and task logs to a file.",
+             "parameters": {"type": "OBJECT", "properties": {}}},
+            {"name": "new_conversation", "description": "Start a fresh conversation. Clears the voice context. Tasks keep running.",
+             "parameters": {"type": "OBJECT", "properties": {}}}
         ]},
         {"googleSearch": {}}
     ])
