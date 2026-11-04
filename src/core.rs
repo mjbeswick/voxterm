@@ -46,7 +46,7 @@ impl Default for Config {
             echo_gate: None,
             echo_tail_ms: 600,
             mic_min_rms: 0.0,
-            hal_style: false,
+            hal_style: true,
         }
     }
 }
