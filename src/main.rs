@@ -6,6 +6,7 @@ mod aec;
 mod audio;
 mod core;
 mod live;
+mod memory;
 mod theme;
 mod ui;
 
@@ -61,6 +62,7 @@ async fn selftest(key: &str) -> Result<()> {
         model: core::Config::default().live_model,
         voice: "Kore".into(),
         style: "plain".into(),
+        memory: String::new(),
     };
     let samples = live::once(key, &s, "Say hello in one short sentence.").await?;
     println!(

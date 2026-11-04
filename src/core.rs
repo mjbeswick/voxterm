@@ -313,6 +313,7 @@ fn settings_of(c: &Config) -> Settings {
         model: c.live_model.clone(),
         voice: c.voice.clone(),
         style: c.style.clone(),
+        memory: crate::memory::prompt_block(),
     }
 }
 
@@ -764,6 +765,27 @@ impl Core {
                 },
                 None => json!({"error": "missing model"}),
             },
+            "remember" => match args["text"].as_str() {
+                Some(t) => match crate::memory::add(t) {
+                    Ok(_) => json!({"status": "remembered"}),
+                    Err(e) => json!({"error": e}),
+                },
+                None => json!({"error": "missing text"}),
+            },
+            "recall_memories" => json!(
+                crate::memory::load()
+                    .iter()
+                    .map(|m| m.text.clone())
+                    .collect::<Vec<_>>()
+            ),
+            "forget_memory" => match args["text"].as_str() {
+                Some(t) => match crate::memory::forget(t) {
+                    Ok(0) => json!({"error": "nothing remembered matches that"}),
+                    Ok(n) => json!({"status": format!("forgot {n} item(s)")}),
+                    Err(e) => json!({"error": e}),
+                },
+                None => json!({"error": "missing text"}),
+            },
             "set_style" => {
                 json!({"status": self.set_style(args["style"].as_str().unwrap_or("plain"))})
             }
@@ -1024,6 +1046,7 @@ impl Core {
             model: self.cfg.live_model.clone(),
             voice: name.to_string(),
             style: self.cfg.style.clone(),
+            memory: String::new(),
         };
         let text = format!("Hi, I'm {name}. This is how I sound.");
         let key = self.key.clone();
@@ -1069,6 +1092,15 @@ impl Core {
                 if let Some(text) = v["text"].as_str().filter(|t| !t.trim().is_empty()) {
                     self.say("you", text, false);
                     let _ = self.live_tx.send(LiveCmd::Text(text.to_string()));
+                }
+            }
+            "memory" => {
+                let items = crate::memory::load();
+                if items.is_empty() {
+                    self.say("sys", "Nothing remembered yet.", false);
+                }
+                for item in items {
+                    self.say("sys", &format!("Remembered: {}", item.text), false);
                 }
             }
             "style" => {

@@ -16,7 +16,7 @@ const WS_URL: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.gener
 const SYSTEM: &str = "You are voxterm. You do the work yourself: you read and change the user's code and files, and you run commands. \
 You do that through tasks. Call start_task with a complete description of the change as soon as the user describes a change, a bug, \
 a refactor, a test, or a command to run. Do not ask permission to start a task. Several tasks can run at once. \
-Use list_tasks and task_status to check on them. Use cancel_task to stop one. When the user says stop, cancel, or never mind, find the task with list_tasks and cancel it. Notes arrive in quotes, naming the task by what it does. When a note says a task is still running, give one short spoken update from its latest output. When a note says a task finished, summarize it in one or two sentences. When a note says a task needs approval, tell the user what is waiting. For a file edit, call approve_change with allow=true only after a spoken yes. For anything else, such as deleting files or running a command, tell the user to press y on screen. Never say there is nothing pending. When a request has several independent parts, start them together with start_tasks, and nest the parts under one parent task when they belong to a larger job. Tasks have no numbers. Refer to a task by its name, or by what it does, such as 'the file change' or 'the cleanup'. Never say the words agent, worker, or sub-agent. Say task, or say I. Keep spoken replies short. \
+Use list_tasks and task_status to check on them. Use cancel_task to stop one. When the user says stop, cancel, or never mind, find the task with list_tasks and cancel it. Notes arrive in quotes, naming the task by what it does. When a note says a task is still running, give one short spoken update from its latest output. When a note says a task finished, summarize it in one or two sentences. When a note says a task needs approval, tell the user what is waiting. For a file edit, call approve_change with allow=true only after a spoken yes. For anything else, such as deleting files or running a command, tell the user to press y on screen. Never say there is nothing pending. When a request has several independent parts, start them together with start_tasks, and nest the parts under one parent task when they belong to a larger job. Tasks have no numbers. Refer to a task by its name, or by what it does, such as 'the file change' or 'the cleanup'. You have a memory: the facts listed at the end of these instructions. When the user asks you to remember something, or states a lasting fact about themselves or their work, call remember and briefly say you saved it. Use recall_memories to list what you know, and forget_memory to remove something. Never say the words agent, worker, or sub-agent. Say task, or say I. Keep spoken replies short. \
 When the user asks to change a setting, a voice, a model, or the mute state, or to manage tasks, use the matching tool, then confirm the new value aloud. Use googleSearch for facts on the web.";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -27,6 +27,8 @@ pub struct Settings {
     pub voice: String,
     /// Name of the speaking style, from STYLES. "plain" adds nothing.
     pub style: String,
+    /// Remembered facts, already formatted for the instructions. Empty when there are none.
+    pub memory: String,
 }
 
 #[derive(Debug)]
@@ -90,6 +92,12 @@ fn tools() -> Value {
              "parameters": {"type": "OBJECT", "properties": {"voice": {"type": "STRING", "enum": ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"]}}, "required": ["voice"]}},
             {"name": "set_live_model", "description": "Change the voice model. The live session reconnects.",
              "parameters": {"type": "OBJECT", "properties": {"model": {"type": "STRING"}}, "required": ["model"]}},
+            {"name": "remember", "description": "Save a lasting fact for future conversations, such as a preference, a project name, or something the user asked you to remember.",
+             "parameters": {"type": "OBJECT", "properties": {"text": {"type": "STRING", "description": "The fact, written as a short sentence"}}, "required": ["text"]}},
+            {"name": "recall_memories", "description": "List what you have remembered.",
+             "parameters": {"type": "OBJECT", "properties": {}}},
+            {"name": "forget_memory", "description": "Remove remembered facts that match the given text.",
+             "parameters": {"type": "OBJECT", "properties": {"text": {"type": "STRING"}}, "required": ["text"]}},
             {"name": "set_style", "description": "Change how the assistant speaks: plain, hal, butler, or coach. The live session reconnects.",
              "parameters": {"type": "OBJECT", "properties": {"style": {"type": "STRING", "enum": ["plain", "hal", "butler", "coach"]}}, "required": ["style"]}},
             {"name": "set_mute", "description": "Mute or unmute the microphone.",
@@ -131,13 +139,13 @@ Never mention coaching or fiction.",
     ),
 ];
 
-fn system_text(style: &str) -> String {
+fn system_text(style: &str, memory: &str) -> String {
     let extra = STYLES
         .iter()
         .find(|(name, _)| *name == style)
         .map(|(_, text)| *text)
         .unwrap_or("");
-    format!("{SYSTEM}{extra}")
+    format!("{SYSTEM}{extra}{memory}")
 }
 
 fn setup(s: &Settings) -> Value {
@@ -147,7 +155,7 @@ fn setup(s: &Settings) -> Value {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": s.voice}}}
         },
-        "systemInstruction": {"parts": [{"text": system_text(&s.style)}]},
+        "systemInstruction": {"parts": [{"text": system_text(&s.style, &s.memory)}]},
         "tools": tools(),
         "inputAudioTranscription": {},
         "outputAudioTranscription": {}
@@ -411,6 +419,7 @@ mod barge_in {
             model: "gemini-3.1-flash-live-preview".into(),
             voice: "Kore".into(),
             style: "plain".into(),
+            memory: String::new(),
         };
         let ws = connect(&key, &settings).await.unwrap();
         let (mut tx, mut rx) = ws.split();

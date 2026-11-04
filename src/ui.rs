@@ -65,6 +65,7 @@ enum Action {
     NextTheme,
     ToggleStyle,
     CopyConversation,
+    ShowMemory,
     Quit,
 }
 
@@ -411,6 +412,7 @@ impl App {
             ("Mute on blur: toggle", "/blur", Action::MuteOnBlur),
             ("Save transcript", "/save", Action::Save),
             ("Copy conversation", "/copy", Action::CopyConversation),
+            ("Show memory", "/memory", Action::ShowMemory),
             ("Theme: pick", "/theme", Action::NextTheme),
             ("Voice style: pick", "/style", Action::ToggleStyle),
             ("Cancel selected task", "ctrl-c", Action::CancelSelected),
@@ -443,6 +445,7 @@ impl App {
             Action::NextTheme => self.open_picker(PickKind::Theme),
             Action::ToggleStyle => self.open_picker(PickKind::Style),
             Action::CopyConversation => self.copy_conversation(),
+            Action::ShowMemory => self.send(json!({"c": "memory"})),
             Action::Quit => self.send(json!({"c": "quit"})),
         }
     }
@@ -549,6 +552,7 @@ impl App {
             "/quit" => return self.send(json!({"c": "quit"})),
             "/theme" => return self.open_picker(PickKind::Theme),
             "/style" => return self.open_picker(PickKind::Style),
+            "/memory" => return self.send(json!({"c": "memory"})),
             "/help" => {
                 return self.palette = Some(Palette {
                     query: String::new(),
