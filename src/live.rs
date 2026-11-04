@@ -393,6 +393,7 @@ mod barge_in {
         let settings = Settings {
             model: "gemini-3.1-flash-live-preview".into(),
             voice: "Kore".into(),
+            hal: false,
         };
         let ws = connect(&key, &settings).await.unwrap();
         let (mut tx, mut rx) = ws.split();
