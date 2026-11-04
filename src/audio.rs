@@ -21,6 +21,8 @@ pub enum AudioCmd {
     Mic(bool),
     Play(Vec<i16>),
     Flush,
+    /// Playback speed factor. 1.0 is normal. Above 1.0 plays faster, which also raises the pitch.
+    Speed(f32),
 }
 
 #[derive(Default)]
@@ -135,6 +137,10 @@ pub fn spawn(
                     shared.lock().unwrap().queue.extend(out);
                 }
                 AudioCmd::Flush => shared.lock().unwrap().queue.clear(),
+                AudioCmd::Speed(r) => {
+                    play_rs =
+                        Resampler::new((24_000.0 * r.clamp(0.5, 2.0)).round() as u32, out_rate);
+                }
             }
         }
     });

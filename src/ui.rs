@@ -46,6 +46,7 @@ enum PickKind {
     Task,
     Theme,
     Style,
+    Speed,
 }
 
 #[derive(Clone, Copy)]
@@ -66,6 +67,7 @@ enum Action {
     ToggleStyle,
     CopyConversation,
     ShowMemory,
+    Speed,
     Quit,
 }
 
@@ -95,6 +97,7 @@ struct Status {
     live_model: String,
     tasks_ready: bool,
     style: String,
+    speed: f32,
 }
 
 struct Picker {
@@ -250,6 +253,7 @@ impl App {
                     live_model: ev["live_model"].as_str().unwrap_or_default().into(),
                     tasks_ready: ev["tasks_ready"].as_bool().unwrap_or(false),
                     style: ev["style"].as_str().unwrap_or("plain").to_string(),
+                    speed: ev["speed"].as_f64().unwrap_or(1.0) as f32,
                 };
             }
             "tasks" => {
@@ -296,6 +300,24 @@ impl App {
     }
 
     fn open_picker(&mut self, kind: PickKind) {
+        if kind == PickKind::Speed {
+            let speeds = [0.8f32, 0.9, 1.0, 1.1, 1.25, 1.5];
+            let current = self.status.speed;
+            self.picker = Some(Picker {
+                kind,
+                title: "speech speed",
+                items: speeds
+                    .iter()
+                    .map(|v| (format!("{v:.2}"), format!("{v:.2}x")))
+                    .collect(),
+                sel: speeds
+                    .iter()
+                    .position(|v| (v - current).abs() < 0.01)
+                    .unwrap_or(2),
+                origin_theme: self.theme,
+            });
+            return;
+        }
         if kind == PickKind::Style {
             let current = self.status.style.clone();
             self.picker = Some(Picker {
@@ -327,7 +349,7 @@ impl App {
             return;
         }
         match kind {
-            PickKind::Theme | PickKind::Style => {}
+            PickKind::Theme | PickKind::Style | PickKind::Speed => {}
             PickKind::Voice => {
                 let sel = VOICES
                     .iter()
@@ -392,6 +414,11 @@ impl App {
             PickKind::Task => self.send(json!({"c": "task_model", "value": value})),
             PickKind::Theme => self.set_theme(&value),
             PickKind::Style => self.send(json!({"c": "style", "name": value})),
+            PickKind::Speed => {
+                if let Ok(v) = value.parse::<f64>() {
+                    self.send(json!({"c": "speed", "value": v}));
+                }
+            }
         }
     }
 
@@ -415,6 +442,7 @@ impl App {
             ("Show memory", "/memory", Action::ShowMemory),
             ("Theme: pick", "/theme", Action::NextTheme),
             ("Voice style: pick", "/style", Action::ToggleStyle),
+            ("Speech speed: pick", "/speed", Action::Speed),
             ("Cancel selected task", "ctrl-c", Action::CancelSelected),
             ("Cancel all tasks", "/cancel-all", Action::CancelAll),
             ("Clear finished tasks", "/clear", Action::ClearFinished),
@@ -446,6 +474,7 @@ impl App {
             Action::ToggleStyle => self.open_picker(PickKind::Style),
             Action::CopyConversation => self.copy_conversation(),
             Action::ShowMemory => self.send(json!({"c": "memory"})),
+            Action::Speed => self.open_picker(PickKind::Speed),
             Action::Quit => self.send(json!({"c": "quit"})),
         }
     }
@@ -552,6 +581,7 @@ impl App {
             "/quit" => return self.send(json!({"c": "quit"})),
             "/theme" => return self.open_picker(PickKind::Theme),
             "/style" => return self.open_picker(PickKind::Style),
+            "/speed" => return self.open_picker(PickKind::Speed),
             "/memory" => return self.send(json!({"c": "memory"})),
             "/help" => {
                 return self.palette = Some(Palette {
@@ -561,6 +591,12 @@ impl App {
                 });
             }
             _ => {}
+        }
+        if let Some(v) = cmd
+            .strip_prefix("/speed ")
+            .and_then(|v| v.trim().trim_end_matches('x').parse::<f64>().ok())
+        {
+            return self.send(json!({"c": "speed", "value": v}));
         }
         if let Some(name) = cmd.strip_prefix("/style ") {
             return self.send(json!({"c": "style", "name": name.trim()}));

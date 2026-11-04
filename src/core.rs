@@ -31,6 +31,9 @@ pub struct Config {
     pub echo_gate: Option<bool>,
     pub echo_tail_ms: u64,
     pub mic_min_rms: f32,
+    /// Speech speed factor. 1.0 is normal.
+    #[serde(default = "default_speed")]
+    pub speech_rate: f32,
     /// Speaking style name, from live::STYLES.
     #[serde(default = "default_style")]
     pub style: String,
@@ -46,6 +49,7 @@ impl Default for Config {
             echo_gate: None,
             echo_tail_ms: 600,
             mic_min_rms: 0.0,
+            speech_rate: 1.0,
             style: "hal".into(),
         }
     }
@@ -217,6 +221,7 @@ pub async fn run(
         Duration::from_millis(cfg.echo_tail_ms),
         cfg.mic_min_rms,
     );
+    let _ = audio.send(AudioCmd::Speed(cfg.speech_rate));
 
     // Task worker. A failure here only disables tasks.
     let worker = {
@@ -302,6 +307,10 @@ fn forward<T: Send + 'static>(
             }
         }
     });
+}
+
+fn default_speed() -> f32 {
+    1.0
 }
 
 fn default_style() -> String {
@@ -450,6 +459,7 @@ impl Core {
             "live_model": self.cfg.live_model,
             "tasks_ready": self.worker.is_some(),
             "style": self.cfg.style,
+            "speed": self.cfg.speech_rate,
         });
         let s = v.to_string();
         if s != self.last_status {
@@ -1101,6 +1111,16 @@ impl Core {
                 }
                 for item in items {
                     self.say("sys", &format!("Remembered: {}", item.text), false);
+                }
+            }
+            "speed" => {
+                if let Some(v) = v["value"].as_f64() {
+                    let rate = (v as f32).clamp(0.7, 1.5);
+                    self.cfg.speech_rate = rate;
+                    self.cfg.save();
+                    let _ = self.audio.send(AudioCmd::Speed(rate));
+                    self.say("sys", &format!("speech speed: {rate:.2}x"), false);
+                    self.emit_status();
                 }
             }
             "style" => {
