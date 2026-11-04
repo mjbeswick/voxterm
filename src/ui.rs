@@ -63,6 +63,7 @@ enum Action {
     ClearFinished,
     NextTheme,
     ToggleStyle,
+    CopyConversation,
     Quit,
 }
 
@@ -390,6 +391,7 @@ impl App {
             ),
             ("Mute on blur: toggle", "/blur", Action::MuteOnBlur),
             ("Save transcript", "/save", Action::Save),
+            ("Copy conversation", "/copy", Action::CopyConversation),
             ("Theme: pick", "/theme", Action::NextTheme),
             (
                 if self.status.hal {
@@ -429,6 +431,7 @@ impl App {
             Action::ClearFinished => self.clear_finished(),
             Action::NextTheme => self.open_picker(PickKind::Theme),
             Action::ToggleStyle => self.send(json!({"c": "style", "hal": !self.status.hal})),
+            Action::CopyConversation => self.copy_conversation(),
             Action::Quit => self.send(json!({"c": "quit"})),
         }
     }
@@ -471,6 +474,35 @@ impl App {
         }
     }
 
+    /// Copies the conversation to the clipboard. Mouse capture stops the terminal's own selection,
+    /// so this is the way to take text out. On macOS it uses pbcopy.
+    fn copy_conversation(&mut self) {
+        let text = self
+            .says
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if text.trim().is_empty() {
+            self.note = "nothing to copy yet".into();
+            return;
+        }
+        let result = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(text.as_bytes())?;
+                }
+                child.wait().map(|_| ())
+            });
+        self.note = match result {
+            Ok(()) => "conversation copied to the clipboard".into(),
+            Err(e) => format!("copy failed: {e}"),
+        };
+    }
+
     fn toggle_tasks(&mut self) {
         self.tasks_visible = !self.tasks_visible;
         if self.tasks_visible {
@@ -500,6 +532,7 @@ impl App {
             "/mute" => return self.send(json!({"c": "mute", "on": true})),
             "/unmute" => return self.send(json!({"c": "mute", "on": false})),
             "/save" => return self.send(json!({"c": "save"})),
+            "/copy" => return self.copy_conversation(),
             "/cancel-all" => return self.send(json!({"c": "cancel_all"})),
             "/clear" => return self.clear_finished(),
             "/quit" => return self.send(json!({"c": "quit"})),
@@ -1200,6 +1233,7 @@ impl App {
             ("tasks", "^A", Action::FocusTasks),
             ("log", "^L", Action::ToggleLog),
             ("palette", "^P", Action::OpenCommands),
+            ("copy", "/copy", Action::CopyConversation),
             ("save", "/save", Action::Save),
             ("quit", "^Q", Action::Quit),
         ];
