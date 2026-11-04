@@ -688,6 +688,11 @@ impl Core {
                             options,
                         });
                     }
+                    self.say(
+                        "sys",
+                        &format!("Approval needed: {title}. Press y to allow or n to deny."),
+                        false,
+                    );
                     self.notice(format!(
                         "[task {id} needs approval: {title} ({kind}). If it is a file edit and the user says yes aloud, call approve_change. Otherwise tell the user to press y on screen.]"
                     ));

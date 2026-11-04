@@ -587,6 +587,12 @@ impl App {
             match key.code {
                 KeyCode::Char('q') => return self.send(json!({"c": "quit"})),
                 KeyCode::Char('c') => return self.ctrl_c(),
+                KeyCode::Char('o') => return self.focus = Focus::Conversation,
+                KeyCode::Char('a') => return self.focus = Focus::Tasks,
+                KeyCode::Char('l') => {
+                    self.log_open = !self.log_open;
+                    return;
+                }
                 KeyCode::Char('k') => {
                     return self.palette = Some(Palette {
                         query: String::new(),
@@ -699,25 +705,42 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
-fn panel(title: &str, color: Color, t: &Theme) -> Block<'static> {
+/// Panel title with an optional hotkey letter, highlighted in red as btop does.
+fn title_line(name: &str, hot: Option<usize>, t: &Theme) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, ch) in name.chars().enumerate() {
+        let style = if Some(i) == hot {
+            Style::new().fg(t.bad).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(t.accent).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans)
+}
+
+fn panel_line(title: Line<'static>, color: Color, t: &Theme) -> Block<'static> {
+    let _ = t;
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(color))
-        .title(Line::styled(
-            format!(" {title} "),
-            Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
-        ))
+        .title(title)
+}
+
+fn panel(title: &str, color: Color, t: &Theme) -> Block<'static> {
+    panel_line(title_line(title, None, t), color, t)
 }
 
 fn pane(
     f: &mut Frame,
     area: Rect,
-    title: &str,
+    title: Line<'static>,
     lines: Vec<Line<'static>>,
     border: Color,
     t: &Theme,
 ) {
-    let block = panel(title, border, t);
+    let block = panel_line(title, border, t);
     let inner = block.inner(area);
     let rows: u16 = lines.iter().map(|l| rows_of(l.width(), inner.width)).sum();
     let scroll = rows.saturating_sub(inner.height);
@@ -817,26 +840,28 @@ impl App {
         } else {
             t.border
         };
+        // No speaker labels. Your text and the assistant's text differ by colour.
+        // Core notices (approvals, failures) show inline in a dim italic style.
         let says: Vec<Line> = self
             .says
             .iter()
             .map(|s| {
-                let (label, lc) = match s.who.as_str() {
-                    "you" => ("you ", t.special),
-                    "asst" => ("asst", t.good),
-                    _ => ("sys ", t.muted),
+                let style = match s.who.as_str() {
+                    "you" => Style::new().fg(t.accent),
+                    "asst" => Style::new().fg(t.good),
+                    _ => Style::new().fg(t.warn).add_modifier(Modifier::ITALIC),
                 };
-                let tc = if s.who == "sys" { t.muted } else { t.fg };
-                Line::from(vec![
-                    Span::styled(
-                        format!("{label}  "),
-                        Style::new().fg(lc).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(s.text.clone(), Style::new().fg(tc)),
-                ])
+                Line::styled(s.text.clone(), style)
             })
             .collect();
-        pane(f, left, "conversation", says, conv_border, &t);
+        pane(
+            f,
+            left,
+            title_line("conversation", Some(1), &t),
+            says,
+            conv_border,
+            &t,
+        );
 
         let (task_list, log) = if self.log_open {
             let [a, b] = Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -887,8 +912,8 @@ impl App {
             } else {
                 Style::new().fg(t.muted)
             };
-            let block =
-                panel("tasks", task_border, &t).title_bottom(Line::styled(label, btn_style));
+            let block = panel_line(title_line("tasks", Some(1), &t), task_border, &t)
+                .title_bottom(Line::styled(label, btn_style));
             let inner = block.inner(task_list);
             let rows: u16 = task_lines
                 .iter()
@@ -923,10 +948,11 @@ impl App {
                     .rev()
                     .map(|l| Line::styled(l.clone(), Style::new().fg(t.dim)))
                     .collect();
+                let log_name = format!("task {} log", task.id);
                 pane(
                     f,
                     log,
-                    &format!("task {} log", task.id),
+                    title_line(&log_name, log_name.rfind('l'), &t),
                     lines,
                     t.border,
                     &t,
@@ -994,10 +1020,10 @@ impl App {
         } else {
             match self.focus {
                 Focus::Tasks => {
-                    "↑↓ select · enter log · ctrl-c cancel · tab next · ctrl-k commands".into()
+                    "↑↓ select · enter log · ctrl-c cancel · ctrl-o chat · ctrl-l log · ctrl-k commands".into()
                 }
-                Focus::Conversation => "tab next · ctrl-t mute · ctrl-k commands".into(),
-                Focus::Input => "enter send · ctrl-t mute · tab focus · ctrl-k commands".into(),
+                Focus::Conversation => "ctrl-a tasks · ctrl-l log · ctrl-t mute · ctrl-k commands".into(),
+                Focus::Input => "enter send · ctrl-a tasks · ctrl-o chat · ctrl-t mute · ctrl-k commands".into(),
             }
         };
         f.render_widget(
