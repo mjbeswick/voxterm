@@ -20,8 +20,9 @@ use live::{LiveCmd, LiveEvent, Settings};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
-    style::{Style, Stylize},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -589,13 +590,10 @@ fn tail_chars(s: &str, n: usize) -> String {
     t.into_iter().collect()
 }
 
-/// Wrapped row count, used to keep the newest line in view.
-fn rows(text: &str, width: usize) -> u16 {
-    let w = width.max(1);
-    text.split('\n')
-        .map(|l| l.chars().count().max(1).div_ceil(w))
-        .sum::<usize>()
-        .min(u16::MAX as usize) as u16
+/// Wrapped row count for one line, used to keep the newest line in view.
+fn rows_of(width: usize, cols: u16) -> u16 {
+    let w = (cols as usize).max(1);
+    width.max(1).div_ceil(w) as u16
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -609,12 +607,19 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
-fn pane(f: &mut Frame, area: Rect, title: &str, text: &str) {
-    let block = Block::bordered().title(title.to_string());
+fn pane(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, accent: Color) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().dark_gray())
+        .title(Line::styled(
+            format!(" {title} "),
+            Style::new().fg(accent).bold(),
+        ));
     let inner = block.inner(area);
-    let scroll = rows(text, inner.width as usize).saturating_sub(inner.height);
+    let rows: u16 = lines.iter().map(|l| rows_of(l.width(), inner.width)).sum();
+    let scroll = rows.saturating_sub(inner.height);
     f.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
             .block(block),
@@ -622,25 +627,88 @@ fn pane(f: &mut Frame, area: Rect, title: &str, text: &str) {
     );
 }
 
-/// Top bar colour: red = live down, magenta = assistant speaking, yellow = mic muted,
+/// Header state: label and colour. Red = retrying, magenta = speaking, yellow = muted,
 /// green = listening, cyan = connecting.
-fn header_style(app: &App) -> Style {
+fn header_state(app: &App) -> (&'static str, Color) {
     let live_up = app.live_status.starts_with("live: ") && !app.live_status.contains("retrying");
     let speaking = app
         .last_audio
         .is_some_and(|t| t.elapsed() < Duration::from_millis(800));
-    let base = Style::new().black();
     if app.live_status.contains("retrying") {
-        base.on_red()
+        ("RETRYING", Color::Red)
     } else if speaking {
-        base.on_magenta()
+        ("SPEAKING", Color::Magenta)
     } else if !app.mic_wanted() {
-        base.on_yellow()
+        ("MUTED", Color::Yellow)
     } else if live_up {
-        base.on_green()
+        ("LISTENING", Color::Green)
     } else {
-        base.on_cyan()
+        ("CONNECTING", Color::Cyan)
     }
+}
+
+fn transcript_lines(app: &App) -> Vec<Line<'static>> {
+    app.transcript
+        .iter()
+        .map(|e| {
+            let (label, label_style, text_style) = match e.who {
+                "you" => ("you ", Style::new().cyan().bold(), Style::new()),
+                "asst" => ("asst", Style::new().green().bold(), Style::new()),
+                _ => ("sys ", Style::new().dark_gray(), Style::new().dark_gray()),
+            };
+            Line::from(vec![
+                Span::styled(format!("{label}  "), label_style),
+                Span::styled(e.text.clone(), text_style),
+            ])
+        })
+        .collect()
+}
+
+fn agent_lines(app: &App) -> Vec<Line<'static>> {
+    app.agent_log
+        .iter()
+        .map(|l| {
+            let style = if l.starts_with('>') {
+                Style::new().cyan()
+            } else if l.starts_with('[') {
+                Style::new().dark_gray()
+            } else if l.starts_with("done") || l.starts_with("agent ready") {
+                Style::new().green()
+            } else if l.starts_with("error") {
+                Style::new().red().bold()
+            } else if l.starts_with('?') || l.starts_with("permission") {
+                Style::new().yellow()
+            } else {
+                Style::new()
+            };
+            Line::styled(l.clone(), style)
+        })
+        .collect()
+}
+
+fn hint_line() -> Line<'static> {
+    let keys = [
+        ("F2", "mic"),
+        ("F3", "voice"),
+        ("F4", "live"),
+        ("F5", "agent"),
+        ("F6", "blur"),
+        ("F7", "save"),
+        ("ctrl-c", "cancel"),
+        ("ctrl-q", "quit"),
+    ];
+    let mut spans = Vec::new();
+    for (key, label) in keys {
+        spans.push(Span::styled(
+            format!(" {key} "),
+            Style::new().white().on_dark_gray().bold(),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}  "),
+            Style::new().dark_gray(),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn draw(f: &mut Frame, app: &App) {
@@ -651,59 +719,86 @@ fn draw(f: &mut Frame, app: &App) {
         Constraint::Length(1),
     ])
     .areas(f.area());
-    let mic = if app.mic_wanted() {
-        "mic on"
-    } else {
-        "mic muted"
-    };
+
+    let (state, color) = header_state(app);
     let agent = if app.agent_tx.is_none() {
-        "agent off"
+        "off"
     } else if app.agent_busy {
-        "agent busy"
+        "busy"
     } else {
-        "agent idle"
+        "idle"
     };
-    let bar = format!(
-        " voxterm · {} · {} · {mic} · {agent} · {}",
-        app.cfg.voice, app.cfg.live_model, app.live_status
-    );
-    f.render_widget(Paragraph::new(bar).style(header_style(app)), top);
+    let header = Line::from(vec![
+        Span::styled(" voxterm ", Style::new().bold()),
+        Span::styled(format!(" {state} "), Style::new().black().bg(color).bold()),
+        Span::styled(
+            format!(
+                "  {} · {} · agent {}  ",
+                app.cfg.voice, app.cfg.live_model, agent
+            ),
+            Style::new().dark_gray(),
+        ),
+        Span::styled(app.live_status.clone(), Style::new().dark_gray()),
+    ]);
+    f.render_widget(Paragraph::new(header), top);
 
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(main);
-    let transcript: Vec<String> = app
-        .transcript
-        .iter()
-        .map(|e| format!("{}: {}", e.who, e.text))
-        .collect();
-    pane(f, left, " conversation ", &transcript.join("\n"));
-    pane(f, right, " agent ", &app.agent_log.join("\n"));
+    pane(f, left, "conversation", transcript_lines(app), Color::Cyan);
+    pane(f, right, "agent", agent_lines(app), Color::Yellow);
 
+    let prompt = if app.input.is_empty() {
+        Line::from(vec![
+            Span::styled("› ", Style::new().cyan().bold()),
+            Span::styled("type to talk", Style::new().dark_gray()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("› ", Style::new().cyan().bold()),
+            Span::raw(app.input.clone()),
+        ])
+    };
     f.render_widget(
-        Paragraph::new(format!("> {}", app.input))
-            .block(Block::bordered().title(" type, enter sends ")),
+        Paragraph::new(prompt).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().cyan())
+                .title(" message · enter sends "),
+        ),
         input,
     );
     f.set_cursor_position(Position::new(
         input.x + 3 + app.input.chars().count() as u16,
         input.y + 1,
     ));
-    f.render_widget(
-        Paragraph::new(" F2 mic · F3 voice · F4 live model · F5 agent model · F6 mute on blur · F7 save · ctrl-c cancel/quit ").style(Style::new().dark_gray()),
-        hint,
-    );
+    f.render_widget(Paragraph::new(hint_line()), hint);
 
     if let Some(p) = &app.perm {
-        let area = centered(f.area(), 64, 7);
+        let area = centered(f.area(), 64, 8);
         f.render_widget(Clear, area);
-        let text = format!(
-            "Agent wants: {}\nkind: {}\n\n[y] allow   [n] deny   [esc] deny",
-            p.title, p.kind
-        );
+        let text = vec![
+            Line::styled(p.title.clone(), Style::new().bold()),
+            Line::styled(format!("kind: {}", p.kind), Style::new().dark_gray()),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" y ", Style::new().black().on_green().bold()),
+                Span::raw(" allow    "),
+                Span::styled(" n ", Style::new().white().on_red().bold()),
+                Span::raw(" deny    "),
+                Span::styled("esc", Style::new().dark_gray()),
+                Span::styled(" deny", Style::new().dark_gray()),
+            ]),
+        ];
         f.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: true })
-                .block(Block::bordered().title(" permission ").yellow()),
+            Paragraph::new(text).wrap(Wrap { trim: true }).block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().yellow())
+                    .title(Line::styled(
+                        " agent asks permission ",
+                        Style::new().yellow().bold(),
+                    )),
+            ),
             area,
         );
     }
@@ -718,8 +813,14 @@ fn draw(f: &mut Frame, app: &App) {
             .collect();
         let mut state = ListState::default().with_selected(Some(p.sel));
         let list = List::new(items)
-            .block(Block::bordered().title(p.title))
-            .highlight_style(Style::new().reversed());
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().cyan())
+                    .title(Line::styled(p.title, Style::new().cyan().bold())),
+            )
+            .highlight_style(Style::new().bg(Color::DarkGray).bold())
+            .highlight_symbol("▸ ");
         f.render_stateful_widget(list, area, &mut state);
     }
 }
@@ -854,4 +955,78 @@ async fn selftest(key: &str) -> Result<()> {
         if samples.is_empty() { "FAIL" } else { "PASS" }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod ui_snapshot {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn sample_app() -> App {
+        let (live_tx, _) = mpsc::unbounded_channel();
+        let (ui_tx, _) = mpsc::unbounded_channel();
+        let (audio_tx, _) = std::sync::mpsc::channel();
+        let entry = |who: &'static str, text: &str| Entry {
+            who,
+            text: text.to_string(),
+            open: false,
+        };
+        App {
+            cfg: Config::default(),
+            key: String::new(),
+            live_tx,
+            agent_tx: None,
+            audio_tx,
+            ui_tx,
+            transcript: vec![
+                entry("you", "add retry to the fetch function"),
+                entry(
+                    "asst",
+                    "Starting that now. I'll tell you when the agent finishes.",
+                ),
+                entry(
+                    "sys",
+                    "voice: Puck. live session reconnects; context resets",
+                ),
+            ],
+            agent_log: vec![
+                "> add retry to the fetch function".into(),
+                "[read src/fetch.rs completed]".into(),
+                "· Adding exponential backoff with three tries.".into(),
+                "? permission: src/fetch.rs (edit)".into(),
+                "done (end_turn)".into(),
+            ],
+            agent_last: String::new(),
+            agent_busy: false,
+            agent_models: vec![],
+            live_models: vec![],
+            live_status: "live: gemini-3.1-flash-live-preview / Kore".into(),
+            input: "and add a test".into(),
+            manual_mute: false,
+            focused: true,
+            perm: None,
+            picker: None,
+            quit: false,
+            last_audio: None,
+        }
+    }
+
+    #[test]
+    fn render_snapshot() {
+        let app = sample_app();
+        let mut term = Terminal::new(TestBackend::new(110, 28)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        println!("{text}");
+        assert!(text.contains("LISTENING"));
+        assert!(text.contains("conversation"));
+    }
 }
