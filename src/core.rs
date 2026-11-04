@@ -319,6 +319,13 @@ impl Core {
         self.emit(json!({"t": "close"}));
     }
 
+    /// Drops finished, failed, and cancelled tasks from the list.
+    fn clear_finished(&mut self) {
+        self.tasks
+            .retain(|t| matches!(t.status, "starting" | "running" | "needs_approval"));
+        self.emit_tasks();
+    }
+
     fn emit_levels(&self) {
         let (mic, out) = crate::audio::LEVELS
             .lock()
@@ -525,7 +532,7 @@ impl Core {
                 match kind {
                     None => json!({"error": "nothing waiting for approval on that task"}),
                     Some(k) if allow && k != "edit" => {
-                        json!({"error": "only file edits can be approved by voice. Ask the user to confirm on screen."})
+                        json!({"error": "this change is waiting for approval on screen. Tell the user to press y in the tasks panel. Do not say there is nothing pending."})
                     }
                     Some(_) => match self.resolve_perm(tid, allow) {
                         Ok(()) => json!({"status": if allow { "approved" } else { "denied" }}),
@@ -637,7 +644,7 @@ impl Core {
                         });
                     }
                     self.notice(format!(
-                        "[task {id} needs approval: {title} ({kind}). Ask the user aloud. Call approve_change if they confirm.]"
+                        "[task {id} needs approval: {title} ({kind}). If it is a file edit and the user says yes aloud, call approve_change. Otherwise tell the user to press y on screen.]"
                     ));
                 }
                 self.emit_tasks();
@@ -877,6 +884,7 @@ impl Core {
                     }
                 }
             }
+            "clear_finished" => self.clear_finished(),
             "cancel_all" => {
                 self.cancel_active();
             }

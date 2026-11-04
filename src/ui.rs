@@ -4,8 +4,9 @@
 use crate::theme::{self, THEMES, Theme};
 use crossterm::{
     event::{
-        self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
 };
@@ -21,7 +22,9 @@ use serde_json::{Value, json};
 use std::{io, path::PathBuf, time::Duration};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-pub const VOICES: [&str; 8] = [
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+const VOICES: [&str; 8] = [
     "Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr",
 ];
 
@@ -49,6 +52,7 @@ enum Action {
     Save,
     CancelSelected,
     CancelAll,
+    ClearFinished,
     NextTheme,
     Quit,
 }
@@ -109,6 +113,8 @@ pub struct App {
     quit: bool,
     mic_hist: Vec<u64>,
     out_hist: Vec<u64>,
+    tick: usize,
+    clear_btn: Option<Rect>,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -148,6 +154,8 @@ impl App {
             quit: false,
             mic_hist: vec![],
             out_hist: vec![],
+            tick: 0,
+            clear_btn: None,
         }
     }
 
@@ -344,6 +352,7 @@ impl App {
             ("Theme: next", "/theme", Action::NextTheme),
             ("Cancel selected task", "ctrl-c", Action::CancelSelected),
             ("Cancel all tasks", "/cancel-all", Action::CancelAll),
+            ("Clear finished tasks", "/clear", Action::ClearFinished),
             ("Quit", "ctrl-q", Action::Quit),
         ]
     }
@@ -358,8 +367,38 @@ impl App {
             Action::Save => self.send(json!({"c": "save"})),
             Action::CancelSelected => self.cancel_selected(),
             Action::CancelAll => self.send(json!({"c": "cancel_all"})),
+            Action::ClearFinished => self.clear_finished(),
             Action::NextTheme => self.next_theme(),
             Action::Quit => self.send(json!({"c": "quit"})),
+        }
+    }
+
+    fn has_finished(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| matches!(t.status.as_str(), "done" | "failed" | "cancelled"))
+    }
+
+    fn clear_finished(&mut self) {
+        if self.has_finished() {
+            self.send(json!({"c": "clear_finished"}));
+            self.note = "cleared finished tasks".into();
+        } else {
+            self.note = "no finished tasks to clear".into();
+        }
+    }
+
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            if let Some(r) = self.clear_btn {
+                let inside = m.column >= r.x
+                    && m.column < r.x + r.width
+                    && m.row >= r.y
+                    && m.row < r.y + r.height;
+                if inside {
+                    self.clear_finished();
+                }
+            }
         }
     }
 
@@ -384,6 +423,7 @@ impl App {
             "/unmute" => return self.send(json!({"c": "mute", "on": false})),
             "/save" => return self.send(json!({"c": "save"})),
             "/cancel-all" => return self.send(json!({"c": "cancel_all"})),
+            "/clear" => return self.clear_finished(),
             "/quit" => return self.send(json!({"c": "quit"})),
             "/theme" => return self.next_theme(),
             "/help" => {
@@ -588,6 +628,7 @@ impl App {
                     self.sel_task = (self.sel_task + 1).min(self.tasks.len().saturating_sub(1))
                 }
                 KeyCode::Enter => self.log_open = !self.log_open,
+                KeyCode::Char('c') => self.clear_finished(),
                 KeyCode::Esc => self.focus = Focus::Input,
                 _ => {}
             },
@@ -712,7 +753,7 @@ fn status_word(s: &str) -> (&str, Color) {
 }
 
 impl App {
-    pub fn draw(&self, f: &mut Frame) {
+    pub fn draw(&mut self, f: &mut Frame) {
         let t = self.t();
         let [top, main, approval, input, hint] = Layout::vertical([
             Constraint::Length(1),
@@ -818,7 +859,10 @@ impl App {
         }
         for (i, task) in self.tasks.iter().enumerate() {
             let (word, color) = status_word(&task.status);
-            let mark = if i == self.sel_task && self.focus == Focus::Tasks {
+            let running = matches!(task.status.as_str(), "running" | "starting");
+            let mark = if running {
+                SPINNER[self.tick % SPINNER.len()]
+            } else if i == self.sel_task && self.focus == Focus::Tasks {
                 "▸"
             } else {
                 " "
@@ -832,7 +876,43 @@ impl App {
                 Span::styled(task.title.clone(), Style::new().fg(t.fg)),
             ]));
         }
-        pane(f, task_list, "tasks", task_lines, task_border, &t);
+        {
+            let label = " [ clear finished ] ";
+            let finished = self.has_finished();
+            let btn_style = if finished {
+                Style::new()
+                    .fg(t.on_accent)
+                    .bg(t.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(t.muted)
+            };
+            let block =
+                panel("tasks", task_border, &t).title_bottom(Line::styled(label, btn_style));
+            let inner = block.inner(task_list);
+            let rows: u16 = task_lines
+                .iter()
+                .map(|l| rows_of(l.width(), inner.width))
+                .sum();
+            let scroll = rows.saturating_sub(inner.height);
+            f.render_widget(
+                Paragraph::new(task_lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0))
+                    .block(block),
+                task_list,
+            );
+            self.clear_btn = if finished {
+                Some(Rect::new(
+                    task_list.x + 2,
+                    task_list.y + task_list.height.saturating_sub(1),
+                    label.chars().count() as u16,
+                    1,
+                ))
+            } else {
+                None
+            };
+        }
         if self.log_open {
             if let Some(task) = self.tasks.get(self.sel_task) {
                 let lines: Vec<Line> = task
@@ -1006,8 +1086,8 @@ pub async fn run(cfg: crate::core::Config, key: String, cwd: PathBuf) -> anyhow:
 
     let mut app = App::new(cmd_tx);
     let mut term = ratatui::init();
-    let _ = execute!(io::stdout(), EnableFocusChange);
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let _ = execute!(io::stdout(), EnableFocusChange, EnableMouseCapture);
+    let mut tick = tokio::time::interval(Duration::from_millis(120));
     let result: anyhow::Result<()> = loop {
         if let Err(e) = term.draw(|f| app.draw(f)) {
             break Err(anyhow::anyhow!(e));
@@ -1019,17 +1099,18 @@ pub async fn run(cfg: crate::core::Config, key: String, cwd: PathBuf) -> anyhow:
             },
             Some(ev) = term_rx.recv() => match ev {
                 Event::Key(k) => app.on_key(k),
+                Event::Mouse(m) => app.on_mouse(m),
                 Event::FocusGained => app.on_focus(true),
                 Event::FocusLost => app.on_focus(false),
                 _ => {}
             },
-            _ = tick.tick() => {}
+            _ = tick.tick() => app.tick = app.tick.wrapping_add(1),
         }
         if app.quit {
             break Ok(());
         }
     };
-    let _ = execute!(io::stdout(), DisableFocusChange);
+    let _ = execute!(io::stdout(), DisableFocusChange, DisableMouseCapture);
     ratatui::restore();
     result
 }
