@@ -98,6 +98,10 @@ struct Task {
     sid: Option<String>,
     log: Vec<String>,
     perm: Option<Perm>,
+    started: Instant,
+    last_update: Instant,
+    /// Set once the first progress note has been spoken.
+    noted: bool,
 }
 
 pub struct Core {
@@ -252,6 +256,7 @@ pub async fn run(
             _ = tick.tick() => {
                 core.emit_status();
                 core.emit_levels();
+                core.progress_updates();
             }
         }
     }
@@ -317,6 +322,43 @@ impl Core {
     fn close(&mut self) {
         self.open = false;
         self.emit(json!({"t": "close"}));
+    }
+
+    /// Speaks a short progress note for tasks that run long: once after 45 seconds, then every minute.
+    fn progress_updates(&mut self) {
+        let now = Instant::now();
+        let mut notes = vec![];
+        for t in self.tasks.iter_mut() {
+            if t.status != "running" {
+                continue;
+            }
+            let due = if t.noted {
+                now.duration_since(t.last_update) >= Duration::from_secs(60)
+            } else {
+                now.duration_since(t.started) >= Duration::from_secs(45)
+            };
+            if due {
+                t.noted = true;
+                t.last_update = now;
+                let secs = now.duration_since(t.started).as_secs();
+                let latest = t
+                    .log
+                    .iter()
+                    .rev()
+                    .find(|l| !l.starts_with('['))
+                    .map(|l| l.trim_start_matches("· ").to_string())
+                    .unwrap_or_default();
+                notes.push(format!(
+                    "[task {} still running after {secs}s: {}. Latest output: {}]",
+                    t.id,
+                    t.title,
+                    short(&latest, 200)
+                ));
+            }
+        }
+        for n in notes {
+            self.notice(n);
+        }
     }
 
     /// Drops finished, failed, and cancelled tasks from the list.
@@ -409,6 +451,9 @@ impl Core {
             sid: None,
             log: vec![],
             perm: None,
+            started: Instant::now(),
+            last_update: Instant::now(),
+            noted: false,
         });
         self.emit_tasks();
         match self.worker.clone() {
