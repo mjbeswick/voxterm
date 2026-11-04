@@ -19,7 +19,11 @@ use ratatui::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -95,6 +99,8 @@ struct Picker {
     title: &'static str,
     items: Vec<(String, String)>,
     sel: usize,
+    /// Theme index when the picker opened. Esc restores it.
+    origin_theme: usize,
 }
 
 struct Palette {
@@ -123,6 +129,8 @@ pub struct App {
     mic_hist: Vec<u64>,
     out_hist: Vec<u64>,
     tick: usize,
+    /// A voice the picker has moved to, waiting for the selection to settle.
+    pending_voice: Option<(String, Instant)>,
     clear_btn: Option<Rect>,
     /// Header state chip. Clicking it toggles the mic.
     mic_btn: Option<Rect>,
@@ -170,6 +178,7 @@ impl App {
             mic_hist: vec![],
             out_hist: vec![],
             tick: 0,
+            pending_voice: None,
             clear_btn: None,
             mic_btn: None,
             buttons: Vec::new(),
@@ -293,6 +302,7 @@ impl App {
                     .map(|t| (t.name.to_string(), t.name.to_string()))
                     .collect(),
                 sel: self.theme,
+                origin_theme: self.theme,
             });
             return;
         }
@@ -311,6 +321,7 @@ impl App {
                         .map(|v| (v.to_string(), v.to_string()))
                         .collect(),
                     sel,
+                    origin_theme: self.theme,
                 });
             }
             PickKind::Live => {
@@ -332,6 +343,7 @@ impl App {
                         .map(|m| (m.clone(), m.clone()))
                         .collect(),
                     sel,
+                    origin_theme: self.theme,
                 });
             }
             PickKind::Task => {
@@ -344,6 +356,7 @@ impl App {
                     title: "task model",
                     items: self.task_models.clone(),
                     sel: 0,
+                    origin_theme: self.theme,
                 });
             }
         }
@@ -605,11 +618,41 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Up => p.sel = p.sel.saturating_sub(1),
-            KeyCode::Down => p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1)),
+            KeyCode::Esc => {
+                if let Some(p) = self.picker.take() {
+                    // Theme shows what you hover, so Esc puts back the one you started with.
+                    if p.kind == PickKind::Theme {
+                        self.theme = p.origin_theme;
+                    }
+                }
+                self.pending_voice = None;
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let last = p.items.len().saturating_sub(1);
+                p.sel = if key.code == KeyCode::Up {
+                    p.sel.saturating_sub(1)
+                } else {
+                    (p.sel + 1).min(last)
+                };
+                let kind = p.kind;
+                let name = p.items.get(p.sel).map(|(v, _)| v.clone());
+                if let Some(name) = name {
+                    match kind {
+                        // The theme applies as you move.
+                        PickKind::Theme => {
+                            if let Some(i) = theme::by_name(&name) {
+                                self.theme = i;
+                            }
+                        }
+                        // The voice applies once the selection has been still for a moment.
+                        PickKind::Voice => self.pending_voice = Some((name, Instant::now())),
+                        _ => {}
+                    }
+                }
+            }
             KeyCode::Enter => {
                 if let Some(p) = self.picker.take() {
+                    self.pending_voice = None;
                     self.apply_picker(p);
                 }
             }
@@ -619,6 +662,16 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Applies a voice once the picker selection has been still for 700 ms.
+    pub fn on_tick(&mut self) {
+        if let Some((name, at)) = self.pending_voice.clone() {
+            if at.elapsed() >= Duration::from_millis(700) {
+                self.pending_voice = None;
+                self.send(json!({"c": "voice", "name": name}));
+            }
         }
     }
 
@@ -660,7 +713,7 @@ impl App {
                     self.log_open = !self.log_open;
                     return;
                 }
-                KeyCode::Char('k') => {
+                KeyCode::Char('p') | KeyCode::Char('k') => {
                     return self.palette = Some(Palette {
                         query: String::new(),
                         sel: 0,
@@ -775,6 +828,41 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 /// Panel title with an optional hotkey letter, highlighted in red as btop does.
 fn title_line(name: &str, hot: Option<usize>, t: &Theme) -> Line<'static> {
     title_with_note(name, hot, None, t)
+}
+
+/// A key label with its letter highlighted, like btop's hotkey marks. "^T" shows the T in red.
+fn key_spans(key: &str, bg: Option<Color>, t: &Theme) -> Vec<Span<'static>> {
+    let mut base = Style::new().fg(t.dim);
+    let mut hot = Style::new().fg(t.bad).add_modifier(Modifier::BOLD);
+    if let Some(c) = bg {
+        base = base.bg(c);
+        hot = hot.bg(c);
+    }
+    if let Some(rest) = key.strip_prefix('^') {
+        return vec![
+            Span::styled("^".to_string(), base),
+            Span::styled(rest.to_string(), hot.add_modifier(Modifier::UNDERLINED)),
+        ];
+    }
+    vec![Span::styled(key.to_string(), base)]
+}
+
+/// A word with its shortcut letter highlighted in place, like "mu**t**e".
+fn word_with_letter(word: &str, letter: Option<char>, bg: Color, t: &Theme) -> Vec<Span<'static>> {
+    let base = Style::new().fg(t.fg).bg(bg).add_modifier(Modifier::BOLD);
+    let hot = Style::new()
+        .fg(t.bad)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let at = letter.and_then(|c| word.to_lowercase().find(c.to_ascii_lowercase()));
+    match at {
+        Some(i) => vec![
+            Span::styled(word[..i].to_string(), base),
+            Span::styled(word[i..i + 1].to_string(), hot),
+            Span::styled(word[i + 1..].to_string(), base),
+        ],
+        None => vec![Span::styled(word.to_string(), base)],
+    }
 }
 
 /// The shared panel title format: name in the accent colour, hotkey letter in red, optional note in grey.
@@ -1110,11 +1198,12 @@ impl App {
         }
 
         // Bottom row: clickable buttons. Each shows the key that does the same thing.
+        // Each word carries its own shortcut letter, which is highlighted inside the word.
         let buttons_def: Vec<(&str, &str, Action)> = vec![
             ("mute", "^T", Action::ToggleMute),
             ("tasks", "^A", Action::FocusTasks),
             ("log", "^L", Action::ToggleLog),
-            ("commands", "^K", Action::OpenCommands),
+            ("palette", "^P", Action::OpenCommands),
             ("save", "/save", Action::Save),
             ("quit", "^Q", Action::Quit),
         ];
@@ -1122,19 +1211,15 @@ impl App {
         let mut x = hint.x;
         let mut spans: Vec<Span> = Vec::new();
         for (label, key, action) in buttons_def {
-            let text = format!(" {label} {key} ");
-            let w = text.chars().count() as u16;
+            let w = (label.chars().count() + 2) as u16;
             if x + w > hint.x + hint.width {
                 break;
             }
             self.buttons.push((Rect::new(x, hint.y, w, 1), action));
-            spans.push(Span::styled(
-                text,
-                Style::new()
-                    .fg(t.fg)
-                    .bg(t.header_bg)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            let letter = key.strip_prefix('^').and_then(|k| k.chars().next());
+            spans.push(Span::styled(" ", Style::new().bg(t.header_bg)));
+            spans.extend(word_with_letter(label, letter, t.header_bg, &t));
+            spans.push(Span::styled(" ", Style::new().bg(t.header_bg)));
             spans.push(Span::raw(" "));
             x += w + 1;
         }
@@ -1179,10 +1264,12 @@ impl App {
                 } else {
                     (t.dim, t.header_bg)
                 };
-                lines.push(Line::styled(
-                    format!("  {label}   {keys}"),
+                let mut row = vec![Span::styled(
+                    format!("  {label}   "),
                     Style::new().fg(fg).bg(bg),
-                ));
+                )];
+                row.extend(key_spans(keys, Some(bg), &t));
+                lines.push(Line::from(row));
             }
             lines.push(Line::styled(
                 "  ↑↓ move · enter run · esc close",
@@ -1256,7 +1343,10 @@ pub async fn run(cfg: crate::core::Config, key: String, cwd: PathBuf) -> anyhow:
                 Event::FocusLost => app.on_focus(false),
                 _ => {}
             },
-            _ = tick.tick() => app.tick = app.tick.wrapping_add(1),
+            _ = tick.tick() => {
+                app.tick = app.tick.wrapping_add(1);
+                app.on_tick();
+            }
         }
         if app.quit {
             break Ok(());
