@@ -1,11 +1,13 @@
-//! voxterm core: voice session, task manager, and JSON-lines protocol.
-//! The terminal UI lives in ui/ and runs on OpenTUI. It starts this binary with --core.
+//! voxterm: a voice assistant for the terminal. Gemini Live talks. Tasks make changes.
+//! One process, one language: the core and the terminal UI run together.
 
 mod acp;
 mod aec;
 mod audio;
 mod core;
 mod live;
+mod theme;
+mod ui;
 
 use anyhow::{Result, anyhow};
 
@@ -13,7 +15,11 @@ use anyhow::{Result, anyhow};
 pub fn dbg(msg: impl AsRef<str>) {
     if let Ok(path) = std::env::var("VOXTERM_LOG") {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
@@ -30,15 +36,11 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--selftest") {
         return selftest(&key).await;
     }
-    if args.iter().any(|a| a == "--core") {
-        let cfg = core::Config::load();
-        let cwd = std::env::current_dir()?;
-        core::run(cfg, key, cwd).await?;
-        // A blocking stdin read can keep the runtime alive after quit. Exit explicitly.
-        std::process::exit(0);
-    }
-    eprintln!("usage: voxterm --core   (the terminal UI is in ui/, run with: bun run ui/index.tsx)");
-    Ok(())
+    let cfg = core::Config::load();
+    let cwd = std::env::current_dir()?;
+    ui::run(cfg, key, cwd).await?;
+    // Blocking terminal and audio threads can keep the runtime alive. Exit explicitly.
+    std::process::exit(0);
 }
 
 /// Headless check: a task writes a file through the worker, and Live returns audio.
@@ -46,7 +48,12 @@ async fn selftest(key: &str) -> Result<()> {
     let dir = std::env::temp_dir().join(format!("voxterm-selftest-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let cmd = vec!["opencode".to_string(), "acp".to_string()];
-    core::selftest_task(&dir, &cmd, "Create a file named hello.txt containing exactly: hi").await?;
+    core::selftest_task(
+        &dir,
+        &cmd,
+        "Create a file named hello.txt containing exactly: hi",
+    )
+    .await?;
     let file = std::fs::read_to_string(dir.join("hello.txt"))?;
     println!("Task: PASS, hello.txt = {:?}", file.trim());
 

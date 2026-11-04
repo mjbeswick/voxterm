@@ -3,9 +3,9 @@
 A full-screen voice assistant for the terminal.
 
 - **Gemini Live** talks with you and searches the web.
-- **A coding agent** (opencode, over the Agent Client Protocol) makes every change to your code.
+- **Tasks** (opencode, over the Agent Client Protocol) make every change to your code, several at once.
 
-The assistant has no file or shell tools. Changes always go through the coding agent.
+The assistant has no file or shell tools. Changes always go through tasks.
 
 ## Setup
 
@@ -13,36 +13,45 @@ The assistant has no file or shell tools. Changes always go through the coding a
 export GEMINI_API_KEY=...      # read from the environment only
 brew install meson ninja       # needed to build WebRTC echo cancellation
 cargo install --path .         # installs `voxterm`
-cd your-project && voxterm     # the agent runs in the current directory
+cd your-project && voxterm     # tasks run in the current directory
 ```
 
 Requires `opencode` on your PATH. Run `opencode acp` once yourself to check it starts.
 
-Headless check: `voxterm --selftest` runs an agent prompt and a Live request.
+Headless check: `voxterm --selftest` runs a task and a Live request.
 
 Live barge-in test (network, macOS `say`): `cargo test barge_in -- --ignored --nocapture`.
 
 Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and playback.
 
+Everything is Rust. The terminal UI is ratatui, and the core runs in the same process.
+
 ## Keys
+
+No function keys. Type to talk. Commands run from the palette or as slash words.
 
 | Key | Action |
 |---|---|
-| Enter | Send typed text to the assistant |
-| F2 | Mic mute or unmute |
-| F3 | Voice picker. `p` previews the highlighted voice |
-| F4 | Live model picker |
-| F5 | Agent model picker |
-| F6 | Toggle mute on blur |
-| F7 | Save transcript to `voxterm-<time>.md` in the working directory |
-| y / n | Approve or deny a permission request |
-| ctrl-c | Cancel the agent. Quits when the agent is idle |
+| Enter | Send the message line |
+| ctrl-k | Command palette. Lists every command and its shortcut |
+| `/` on an empty line | Palette, filtered by what you type. `/voice`, `/model`, `/task-model`, `/mute`, `/unmute`, `/theme <name>`, `/save`, `/cancel-all`, `/quit`, `/help` |
+| ctrl-t | Mute or unmute the microphone |
+| Tab, Shift-Tab | Move focus: conversation, tasks, message line |
+| Up, Down, Enter (tasks focus) | Select a task. Enter opens its log |
+| ctrl-c (tasks focus, task running) | Cancel the selected task |
+| ctrl-c | Quits. Asks once first if tasks are running |
 | ctrl-q | Quit |
+| y / n, Esc | Allow or deny a pending task change. y and n work only while the message line is empty |
+| ctrl-u | Clear the message line |
+| Space (voice picker) | Preview the highlighted voice |
+
+## Themes
+
+Six colour themes from btop: `default`, `dracula`, `nord`, `gruvbox`, `tokyo-night`, `solarized`. Pick one with `/theme <name>`, or cycle with the palette entry. The choice is saved in `~/.config/voxterm/ui.json`.
 
 ## Behavior
 
-- **Header colour:** green = listening, magenta = assistant speaking, yellow = mic muted, red = Live retrying, cyan = connecting.
-
+- **Header state:** green = listening, magenta = speaking, yellow = muted, red = retrying, cyan = connecting.
 - **Mute on blur** drops the mic stream when the terminal loses focus. This turns off the macOS mic indicator.
 - **Echo cancellation** (WebRTC AudioProcessing) runs on the mic. It cancels the speaker output the app played. Its benefit on built-in speakers is not yet measured.
 - **Echo gate** (`echo_gate`, default off). Set to `true` to block the mic while the assistant speaks. The gate also blocks barge-in.
@@ -51,7 +60,7 @@ Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and 
 - **Mic level gate** (`mic_min_rms`, default 0) drops mic chunks quieter than this RMS. Set it from the `mic rms` values in `VOXTERM_LOG`. Room noise in testing read about 0.02 RMS. Speech is louder.
 - **Voice approvals** cover file edits only. Shell and other actions need a screen confirm.
 - **Settings** live in `~/.config/voxterm/config.json`.
-- **Agent model** picks apply to the current session only. A restart uses the agent's default.
+- **Task model** picks apply to new tasks. A restart uses the worker's default.
 - Changing voice or Live model reconnects the assistant. The conversation context resets.
 
 ## Known limits

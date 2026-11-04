@@ -10,18 +10,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::Write,
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
-        oneshot,
-    },
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    oneshot,
 };
 
-pub const VOICES: [&str; 8] = ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"];
+pub const VOICES: [&str; 8] = [
+    "Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr",
+];
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -77,7 +75,11 @@ enum In {
     Ui(Value),
     Live(LiveEvent),
     Worker(WEvent),
-    Session { id: u32, text: String, sid: Result<String, String> },
+    Session {
+        id: u32,
+        text: String,
+        sid: Result<String, String>,
+    },
     LiveModels(Vec<String>),
     Preview(Vec<i16>),
 }
@@ -123,7 +125,11 @@ pub struct Core {
 
 fn short(s: &str, n: usize) -> String {
     let t: String = s.chars().take(n).collect();
-    if s.chars().count() > n { format!("{t}…") } else { t }
+    if s.chars().count() > n {
+        format!("{t}…")
+    } else {
+        t
+    }
 }
 
 fn tail_chars(s: &str, n: usize) -> String {
@@ -133,28 +139,24 @@ fn tail_chars(s: &str, n: usize) -> String {
 }
 
 /// Runs the core until the UI sends quit. Reads commands from stdin and writes events to stdout.
-pub async fn run(cfg: Config, key: String, cwd: std::path::PathBuf) -> Result<()> {
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+/// Runs the core. `out` receives every event as JSON. `commands` carries UI commands as JSON.
+/// The core stops when it gets a quit command, or when the command channel closes.
+pub async fn run(
+    cfg: Config,
+    key: String,
+    cwd: std::path::PathBuf,
+    out: UnboundedSender<Value>,
+    mut commands: UnboundedReceiver<Value>,
+) -> Result<()> {
+    let out_tx = out;
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<In>();
 
-    // Writer: one JSON object per line on stdout.
-    tokio::spawn(async move {
-        let mut stdout = std::io::stdout();
-        while let Some(v) = out_rx.recv().await {
-            let _ = writeln!(stdout, "{v}");
-            let _ = stdout.flush();
-        }
-    });
-
-    // Reader: JSON commands from the UI.
+    // Commands from the UI.
     {
         let tx = in_tx.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                    let _ = tx.send(In::Ui(v));
-                }
+            while let Some(v) = commands.recv().await {
+                let _ = tx.send(In::Ui(v));
             }
             let _ = tx.send(In::Ui(json!({"c": "quit"})));
         });
@@ -163,7 +165,12 @@ pub async fn run(cfg: Config, key: String, cwd: std::path::PathBuf) -> Result<()
     // Live voice session.
     let (live_tx, live_rx) = mpsc::unbounded_channel::<LiveCmd>();
     let (live_ev_tx, mut live_ev_rx) = mpsc::unbounded_channel::<LiveEvent>();
-    tokio::spawn(live::run(key.clone(), settings_of(&cfg), live_rx, live_ev_tx));
+    tokio::spawn(live::run(
+        key.clone(),
+        settings_of(&cfg),
+        live_rx,
+        live_ev_tx,
+    ));
     forward(&mut live_ev_rx, in_tx.clone(), In::Live);
 
     // Audio thread. Errors become status lines.
@@ -249,7 +256,11 @@ pub async fn run(cfg: Config, key: String, cwd: std::path::PathBuf) -> Result<()
     Ok(())
 }
 
-fn forward<T: Send + 'static>(rx: &mut UnboundedReceiver<T>, to: UnboundedSender<In>, wrap: fn(T) -> In) {
+fn forward<T: Send + 'static>(
+    rx: &mut UnboundedReceiver<T>,
+    to: UnboundedSender<In>,
+    wrap: fn(T) -> In,
+) {
     let mut rx = std::mem::replace(rx, mpsc::unbounded_channel().1);
     tokio::spawn(async move {
         while let Some(e) = rx.recv().await {
@@ -281,7 +292,9 @@ impl Core {
     }
 
     fn reconfigure(&self) {
-        let _ = self.live_tx.send(LiveCmd::Reconfigure(settings_of(&self.cfg)));
+        let _ = self
+            .live_tx
+            .send(LiveCmd::Reconfigure(settings_of(&self.cfg)));
     }
 
     /// Adds transcript text. `cont` appends to the open entry of the same speaker.
@@ -304,8 +317,11 @@ impl Core {
     }
 
     fn emit_status(&mut self) {
-        let live_up = self.live_status.starts_with("live: ") && !self.live_status.contains("retrying");
-        let speaking = self.last_audio.is_some_and(|t| t.elapsed() < Duration::from_millis(800));
+        let live_up =
+            self.live_status.starts_with("live: ") && !self.live_status.contains("retrying");
+        let speaking = self
+            .last_audio
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(800));
         let state = if self.live_status.contains("retrying") {
             "retrying"
         } else if speaking {
@@ -368,7 +384,14 @@ impl Core {
     fn start_task(&mut self, title: String, text: String) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
-        self.tasks.push(Task { id, title: title.clone(), status: "starting", sid: None, log: vec![], perm: None });
+        self.tasks.push(Task {
+            id,
+            title: title.clone(),
+            status: "starting",
+            sid: None,
+            log: vec![],
+            perm: None,
+        });
         self.say("sys", &format!("task {id} started: {title}"), false);
         self.emit_tasks();
         match self.worker.clone() {
@@ -404,11 +427,22 @@ impl Core {
         let task = self.task_mut(id).ok_or("no such task")?;
         let perm = task.perm.take().ok_or("nothing waiting for approval")?;
         let want = if allow { "allow" } else { "reject" };
-        let option = perm.options.iter().find(|(_, k)| k.starts_with(want)).map(|(o, _)| o.clone());
+        let option = perm
+            .options
+            .iter()
+            .find(|(_, k)| k.starts_with(want))
+            .map(|(o, _)| o.clone());
         task.status = "running";
-        task.log.push(format!("{}: {}", if allow { "approved" } else { "denied" }, perm.title));
+        task.log.push(format!(
+            "{}: {}",
+            if allow { "approved" } else { "denied" },
+            perm.title
+        ));
         let cmd = match option {
-            Some(option_id) => WCmd::Answer { rpc_id: perm.rpc_id, option_id },
+            Some(option_id) => WCmd::Answer {
+                rpc_id: perm.rpc_id,
+                option_id,
+            },
             None => {
                 task.status = "running";
                 return worker
@@ -429,7 +463,10 @@ impl Core {
         let result = match name.as_str() {
             "start_task" => match args["task"].as_str() {
                 Some(text) if !text.trim().is_empty() => {
-                    let title = args["title"].as_str().map(String::from).unwrap_or_else(|| short(text, 48));
+                    let title = args["title"]
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| short(text, 48));
                     let n = self.start_task(title, text.to_string());
                     json!({"task_id": n, "status": "started"})
                 }
@@ -441,7 +478,10 @@ impl Core {
                     .map(|t| json!({"task_id": t.id, "title": t.title, "status": t.status}))
                     .collect::<Vec<_>>()
             ),
-            "task_status" => match args["task_id"].as_u64().and_then(|n| self.tasks.iter().find(|t| t.id as u64 == n)) {
+            "task_status" => match args["task_id"]
+                .as_u64()
+                .and_then(|n| self.tasks.iter().find(|t| t.id as u64 == n))
+            {
                 Some(t) => json!({
                     "task_id": t.id,
                     "status": t.status,
@@ -451,7 +491,10 @@ impl Core {
                 None => json!({"error": "no such task"}),
             },
             "cancel_task" => {
-                let sid = args["task_id"].as_u64().and_then(|n| self.tasks.iter().find(|t| t.id as u64 == n)).and_then(|t| t.sid.clone());
+                let sid = args["task_id"]
+                    .as_u64()
+                    .and_then(|n| self.tasks.iter().find(|t| t.id as u64 == n))
+                    .and_then(|t| t.sid.clone());
                 match (sid, &self.worker) {
                     (Some(sid), Some(w)) => {
                         let _ = w.send(WCmd::Cancel { sid });
@@ -463,7 +506,12 @@ impl Core {
             "approve_change" => {
                 let allow = args["allow"].as_bool().unwrap_or(false);
                 let tid = args["task_id"].as_u64().unwrap_or(0);
-                let kind = self.tasks.iter().find(|t| t.id as u64 == tid).and_then(|t| t.perm.as_ref()).map(|p| p.kind.clone());
+                let kind = self
+                    .tasks
+                    .iter()
+                    .find(|t| t.id as u64 == tid)
+                    .and_then(|t| t.perm.as_ref())
+                    .map(|p| p.kind.clone());
                 match kind {
                     None => json!({"error": "nothing waiting for approval on that task"}),
                     Some(k) if allow && k != "edit" => {
@@ -476,21 +524,34 @@ impl Core {
                 }
             }
             "set_voice" => match args["voice"].as_str() {
-                Some(v) => match self.set_voice(v) { Ok(m) => json!({"status": m}), Err(e) => json!({"error": e}) },
+                Some(v) => match self.set_voice(v) {
+                    Ok(m) => json!({"status": m}),
+                    Err(e) => json!({"error": e}),
+                },
                 None => json!({"error": "missing voice"}),
             },
             "preview_voice" => match args["voice"].as_str() {
-                Some(v) => match self.preview(v) { Ok(m) => json!({"status": m}), Err(e) => json!({"error": e}) },
+                Some(v) => match self.preview(v) {
+                    Ok(m) => json!({"status": m}),
+                    Err(e) => json!({"error": e}),
+                },
                 None => json!({"error": "missing voice"}),
             },
             "set_live_model" => match args["model"].as_str() {
-                Some(m) => match self.set_live_model(m) { Ok(s) => json!({"status": s}), Err(e) => json!({"error": e}) },
+                Some(m) => match self.set_live_model(m) {
+                    Ok(s) => json!({"status": s}),
+                    Err(e) => json!({"error": e}),
+                },
                 None => json!({"error": "missing model"}),
             },
             "set_mute" => json!({"status": self.set_mute(args["muted"].as_bool().unwrap_or(true))}),
-            "set_mute_on_blur" => json!({"status": self.set_mute_on_blur(args["on"].as_bool().unwrap_or(true))}),
+            "set_mute_on_blur" => {
+                json!({"status": self.set_mute_on_blur(args["on"].as_bool().unwrap_or(true))})
+            }
             "get_settings" => self.settings_summary(),
-            "cancel_all_tasks" => json!({"status": format!("cancel requested for {} task(s)", self.cancel_active())}),
+            "cancel_all_tasks" => {
+                json!({"status": format!("cancel requested for {} task(s)", self.cancel_active())})
+            }
             "save_transcript" => {
                 self.save_transcript();
                 json!({"status": "transcript saved"})
@@ -547,12 +608,23 @@ impl Core {
                 }
                 self.emit_tasks();
             }
-            WEvent::Permission { sid, rpc_id, title, kind, options } => {
+            WEvent::Permission {
+                sid,
+                rpc_id,
+                title,
+                kind,
+                options,
+            } => {
                 if let Some(id) = self.by_sid.get(&sid).copied() {
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
                         t.status = "needs_approval";
                         t.log.push(format!("? {title} ({kind})"));
-                        t.perm = Some(Perm { rpc_id, title: title.clone(), kind: kind.clone(), options });
+                        t.perm = Some(Perm {
+                            rpc_id,
+                            title: title.clone(),
+                            kind: kind.clone(),
+                            options,
+                        });
                     }
                     self.say("sys", &format!("task {id} needs approval: {title}"), false);
                     self.notice(format!(
@@ -642,23 +714,37 @@ impl Core {
 
     /// Shared by the UI commands and the voice tools. Each returns a short result for the model.
     fn set_voice(&mut self, name: &str) -> Result<String, String> {
-        let name = VOICES.iter().find(|v| v.eq_ignore_ascii_case(name)).ok_or_else(|| format!("unknown voice. Choose from: {}", VOICES.join(", ")))?;
+        let name = VOICES
+            .iter()
+            .find(|v| v.eq_ignore_ascii_case(name))
+            .ok_or_else(|| format!("unknown voice. Choose from: {}", VOICES.join(", ")))?;
         self.cfg.voice = name.to_string();
         self.cfg.save();
         self.reconfigure();
-        self.say("sys", &format!("voice: {name}. Live session reconnects; context resets"), false);
+        self.say(
+            "sys",
+            &format!("voice: {name}. Live session reconnects; context resets"),
+            false,
+        );
         self.emit_status();
         Ok(format!("voice set to {name}"))
     }
 
     fn set_live_model(&mut self, name: &str) -> Result<String, String> {
         if !self.live_models.is_empty() && !self.live_models.iter().any(|m| m == name) {
-            return Err(format!("unknown model. Choose from: {}", self.live_models.join(", ")));
+            return Err(format!(
+                "unknown model. Choose from: {}",
+                self.live_models.join(", ")
+            ));
         }
         self.cfg.live_model = name.to_string();
         self.cfg.save();
         self.reconfigure();
-        self.say("sys", &format!("live model: {name}. Live session reconnects; context resets"), false);
+        self.say(
+            "sys",
+            &format!("live model: {name}. Live session reconnects; context resets"),
+            false,
+        );
         self.emit_status();
         Ok(format!("live model set to {name}"))
     }
@@ -667,7 +753,11 @@ impl Core {
         self.manual_mute = on;
         self.apply_mic();
         self.emit_status();
-        if on { "microphone muted".into() } else { "microphone on".into() }
+        if on {
+            "microphone muted".into()
+        } else {
+            "microphone on".into()
+        }
     }
 
     fn set_mute_on_blur(&mut self, on: bool) -> String {
@@ -679,9 +769,15 @@ impl Core {
     }
 
     fn preview(&mut self, voice: &str) -> Result<String, String> {
-        let name = VOICES.iter().find(|v| v.eq_ignore_ascii_case(voice)).ok_or_else(|| format!("unknown voice. Choose from: {}", VOICES.join(", ")))?;
+        let name = VOICES
+            .iter()
+            .find(|v| v.eq_ignore_ascii_case(voice))
+            .ok_or_else(|| format!("unknown voice. Choose from: {}", VOICES.join(", ")))?;
         let _ = self.audio.send(AudioCmd::Flush);
-        let s = Settings { model: self.cfg.live_model.clone(), voice: name.to_string() };
+        let s = Settings {
+            model: self.cfg.live_model.clone(),
+            voice: name.to_string(),
+        };
         let text = format!("Hi, I'm {name}. This is how I sound.");
         let key = self.key.clone();
         let tx = self.in_tx.clone();
@@ -764,7 +860,11 @@ impl Core {
             }
             "cancel" => {
                 if let Some(n) = v["task"].as_u64() {
-                    let sid = self.tasks.iter().find(|t| t.id as u64 == n).and_then(|t| t.sid.clone());
+                    let sid = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.id as u64 == n)
+                        .and_then(|t| t.sid.clone());
                     if let (Some(sid), Some(w)) = (sid, &self.worker) {
                         let _ = w.send(WCmd::Cancel { sid });
                     }
@@ -797,14 +897,22 @@ impl Core {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let path = std::env::current_dir().unwrap_or_default().join(format!("voxterm-{stamp}.md"));
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join(format!("voxterm-{stamp}.md"));
         let mut out = String::from("# voxterm transcript\n\n## Conversation\n\n");
         for (who, text) in &self.transcript {
             out.push_str(&format!("- **{who}:** {text}\n"));
         }
         out.push_str("\n## Tasks\n\n");
         for t in &self.tasks {
-            out.push_str(&format!("### {} (task {}, {})\n\n```\n{}\n```\n\n", t.title, t.id, t.status, t.log.join("\n")));
+            out.push_str(&format!(
+                "### {} (task {}, {})\n\n```\n{}\n```\n\n",
+                t.title,
+                t.id,
+                t.status,
+                t.log.join("\n")
+            ));
         }
         match std::fs::write(&path, out) {
             Ok(()) => self.say("sys", &format!("saved {}", path.display()), false),
@@ -819,7 +927,10 @@ pub async fn selftest_task(cwd: &std::path::Path, cmd: &[String], text: &str) ->
     let (otx, orx) = oneshot::channel();
     tx.send(WCmd::NewSession(otx))?;
     let sid = orx.await?.map_err(|e| anyhow::anyhow!(e))?;
-    tx.send(WCmd::Prompt { sid, text: text.to_string() })?;
+    tx.send(WCmd::Prompt {
+        sid,
+        text: text.to_string(),
+    })?;
     while let Some(e) = rx.recv().await {
         match e {
             WEvent::Done { .. } => return Ok("done".into()),

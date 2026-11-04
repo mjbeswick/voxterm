@@ -12,11 +12,30 @@ use tokio::{
 #[derive(Debug)]
 pub enum Event {
     Models(Vec<(String, String)>),
-    Text { sid: String, text: String },
-    Tool { sid: String, line: String },
-    Permission { sid: String, rpc_id: Value, title: String, kind: String, options: Vec<(String, String)> },
-    Done { sid: String, stop: String, text: String },
-    Error { sid: String, msg: String },
+    Text {
+        sid: String,
+        text: String,
+    },
+    Tool {
+        sid: String,
+        line: String,
+    },
+    Permission {
+        sid: String,
+        rpc_id: Value,
+        title: String,
+        kind: String,
+        options: Vec<(String, String)>,
+    },
+    Done {
+        sid: String,
+        stop: String,
+        text: String,
+    },
+    Error {
+        sid: String,
+        msg: String,
+    },
     Info(String),
 }
 
@@ -59,8 +78,13 @@ impl Conn {
 }
 
 /// Starts the worker process and runs the handshake in the background.
-pub async fn start(cmd: &[String], cwd: &Path) -> Result<(mpsc::UnboundedSender<Cmd>, mpsc::UnboundedReceiver<Event>)> {
-    let (prog, args) = cmd.split_first().ok_or_else(|| anyhow!("empty worker command"))?;
+pub async fn start(
+    cmd: &[String],
+    cwd: &Path,
+) -> Result<(mpsc::UnboundedSender<Cmd>, mpsc::UnboundedReceiver<Event>)> {
+    let (prog, args) = cmd
+        .split_first()
+        .ok_or_else(|| anyhow!("empty worker command"))?;
     let mut child = Command::new(prog)
         .args(args)
         .current_dir(cwd)
@@ -70,8 +94,14 @@ pub async fn start(cmd: &[String], cwd: &Path) -> Result<(mpsc::UnboundedSender<
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow!("cannot start {prog}: {e}"))?;
-    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no worker stdin"))?;
-    let stdout = child.stdout.take().ok_or_else(|| anyhow!("no worker stdout"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("no worker stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("no worker stdout"))?;
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Event>();
     let cwd_s = cwd.display().to_string();
@@ -79,17 +109,28 @@ pub async fn start(cmd: &[String], cwd: &Path) -> Result<(mpsc::UnboundedSender<
     tokio::spawn(async move {
         let _child = child; // kill_on_drop when this task ends
         let mut lines = BufReader::new(stdout).lines();
-        let mut conn = Conn { stdin, next: 1, pending: HashMap::new() };
+        let mut conn = Conn {
+            stdin,
+            next: 1,
+            pending: HashMap::new(),
+        };
         let mut texts: HashMap<String, String> = HashMap::new();
         let mut models_sent = false;
         let mut model: Option<String> = None;
 
         if conn
-            .call("initialize", json!({"protocolVersion": 1, "clientCapabilities": {}}), Pending::Init)
+            .call(
+                "initialize",
+                json!({"protocolVersion": 1, "clientCapabilities": {}}),
+                Pending::Init,
+            )
             .await
             .is_err()
         {
-            let _ = ev_tx.send(Event::Error { sid: String::new(), msg: "handshake failed".into() });
+            let _ = ev_tx.send(Event::Error {
+                sid: String::new(),
+                msg: "handshake failed".into(),
+            });
             return;
         }
 
@@ -190,7 +231,10 @@ pub async fn start(cmd: &[String], cwd: &Path) -> Result<(mpsc::UnboundedSender<
                 }
             }
         }
-        let _ = ev_tx.send(Event::Error { sid: String::new(), msg: "worker process exited".into() });
+        let _ = ev_tx.send(Event::Error {
+            sid: String::new(),
+            msg: "worker process exited".into(),
+        });
     });
 
     Ok((cmd_tx, ev_rx))
@@ -236,8 +280,10 @@ mod tests {
     #[test]
     fn tool_line_reports_start_and_finish_only() {
         let start = json!({"sessionUpdate": "tool_call", "title": "write"});
-        let progress = json!({"sessionUpdate": "tool_call_update", "title": "write", "status": "in_progress"});
-        let done = json!({"sessionUpdate": "tool_call_update", "title": "write", "status": "completed"});
+        let progress =
+            json!({"sessionUpdate": "tool_call_update", "title": "write", "status": "in_progress"});
+        let done =
+            json!({"sessionUpdate": "tool_call_update", "title": "write", "status": "completed"});
         assert_eq!(tool_line(&start).as_deref(), Some("write"));
         assert_eq!(tool_line(&progress), None);
         assert_eq!(tool_line(&done).as_deref(), Some("write completed"));
