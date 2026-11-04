@@ -41,6 +41,8 @@ Debug log: `VOXTERM_LOG=/path/to/log voxterm` records UI events, mic state, and 
 
 ## Behavior
 
+- **Header colour:** green = listening, magenta = assistant speaking, yellow = mic muted, red = Live retrying, cyan = connecting.
+
 - **Mute on blur** drops the mic stream when the terminal loses focus. This turns off the macOS mic indicator.
 - **Echo cancellation** (WebRTC AudioProcessing) runs on the mic. It cancels the speaker output the app played. Its benefit on built-in speakers is not yet measured.
 - **Echo gate** (`echo_gate`, default off). Set to `true` to block the mic while the assistant speaks. The gate also blocks barge-in.

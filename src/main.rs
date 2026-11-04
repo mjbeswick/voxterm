@@ -25,7 +25,11 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 const VOICES: [&str; 8] = [
@@ -176,6 +180,7 @@ struct App {
     perm: Option<Perm>,
     picker: Option<Picker>,
     quit: bool,
+    last_audio: Option<Instant>,
 }
 
 impl App {
@@ -251,6 +256,7 @@ impl App {
         match e {
             LiveEvent::Status(s) => self.live_status = s,
             LiveEvent::Audio(s) => {
+                self.last_audio = Some(Instant::now());
                 let _ = self.audio_tx.send(AudioCmd::Play(s));
             }
             LiveEvent::User(t) => self.push_text("you", &t),
@@ -616,6 +622,27 @@ fn pane(f: &mut Frame, area: Rect, title: &str, text: &str) {
     );
 }
 
+/// Top bar colour: red = live down, magenta = assistant speaking, yellow = mic muted,
+/// green = listening, cyan = connecting.
+fn header_style(app: &App) -> Style {
+    let live_up = app.live_status.starts_with("live: ") && !app.live_status.contains("retrying");
+    let speaking = app
+        .last_audio
+        .is_some_and(|t| t.elapsed() < Duration::from_millis(800));
+    let base = Style::new().black();
+    if app.live_status.contains("retrying") {
+        base.on_red()
+    } else if speaking {
+        base.on_magenta()
+    } else if !app.mic_wanted() {
+        base.on_yellow()
+    } else if live_up {
+        base.on_green()
+    } else {
+        base.on_cyan()
+    }
+}
+
 fn draw(f: &mut Frame, app: &App) {
     let [top, main, input, hint] = Layout::vertical([
         Constraint::Length(1),
@@ -640,10 +667,7 @@ fn draw(f: &mut Frame, app: &App) {
         " voxterm · {} · {} · {mic} · {agent} · {}",
         app.cfg.voice, app.cfg.live_model, app.live_status
     );
-    f.render_widget(
-        Paragraph::new(bar).style(Style::new().black().on_cyan()),
-        top,
-    );
+    f.render_widget(Paragraph::new(bar).style(header_style(app)), top);
 
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(main);
@@ -763,6 +787,7 @@ async fn main() -> Result<()> {
         agent_models: vec![],
         live_models: vec![],
         live_status: "live: connecting".into(),
+        last_audio: None,
         input: String::new(),
         manual_mute: false,
         focused: true,
