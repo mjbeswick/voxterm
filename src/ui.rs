@@ -75,6 +75,9 @@ struct Task {
     status: String,
     approval: Option<String>,
     log: Vec<String>,
+    /// Name of the parent task, for subtasks.
+    #[serde(default)]
+    parent: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -976,8 +979,12 @@ impl App {
                 } else {
                     " "
                 };
+                let indent = if task.parent.is_some() { "  └ " } else { "" };
                 task_lines.push(Line::from(vec![
-                    Span::styled(format!("{mark} {} ", task.id), Style::new().fg(t.fg)),
+                    Span::styled(
+                        format!("{mark} {indent}{} ", task.id),
+                        Style::new().fg(t.fg),
+                    ),
                     Span::styled(
                         format!("{word:<10}"),
                         Style::new().fg(color).add_modifier(Modifier::BOLD),
