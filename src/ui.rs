@@ -893,6 +893,94 @@ fn key_spans(key: &str, bg: Option<Color>, t: &Theme) -> Vec<Span<'static>> {
     vec![Span::styled(key.to_string(), base)]
 }
 
+/// Markdown for the conversation: headings, bullets, fenced code, **bold**, *italic*, and `code`.
+fn markdown_lines(text: &str, t: &Theme) -> Vec<Line<'static>> {
+    let base = Style::new().fg(t.good);
+    let mut out = Vec::new();
+    let mut in_code = false;
+    for raw in text.split('\n') {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            out.push(Line::styled(
+                format!("  {raw}"),
+                Style::new().fg(t.special).bg(t.header_bg),
+            ));
+            continue;
+        }
+        if let Some(h) = trimmed.strip_prefix('#') {
+            let h = h.trim_start_matches('#').trim();
+            out.push(Line::styled(
+                h.to_string(),
+                Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+            ));
+            continue;
+        }
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            let mut spans = vec![Span::styled("  • ".to_string(), Style::new().fg(t.accent))];
+            spans.extend(inline_spans(item, base, t));
+            out.push(Line::from(spans));
+            continue;
+        }
+        out.push(Line::from(inline_spans(raw, base, t)));
+    }
+    out
+}
+
+/// Inline markdown: **bold**, *italic*, and `code`, with markers removed.
+fn inline_spans(text: &str, base: Style, t: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut bold = false;
+    let mut italic = false;
+    let mut code = false;
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>, style: Style| {
+        if !buf.is_empty() {
+            spans.push(Span::styled(std::mem::take(buf), style));
+        }
+    };
+    let style_now = |bold: bool, italic: bool, code: bool| {
+        let mut st = base;
+        if bold {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        if italic {
+            st = st.add_modifier(Modifier::ITALIC);
+        }
+        if code {
+            st = st.fg(t.special).bg(t.header_bg);
+        }
+        st
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`' {
+            flush(&mut buf, &mut spans, style_now(bold, italic, code));
+            code = !code;
+        } else if !code && c == '*' && chars.get(i + 1) == Some(&'*') {
+            flush(&mut buf, &mut spans, style_now(bold, italic, code));
+            bold = !bold;
+            i += 1;
+        } else if !code && c == '*' {
+            flush(&mut buf, &mut spans, style_now(bold, italic, code));
+            italic = !italic;
+        } else {
+            buf.push(c);
+        }
+        i += 1;
+    }
+    flush(&mut buf, &mut spans, style_now(bold, italic, code));
+    spans
+}
+
 /// A word with its shortcut letter highlighted in place, like "mu**t**e".
 fn word_with_letter(word: &str, letter: Option<char>, bg: Color, t: &Theme) -> Vec<Span<'static>> {
     let base = Style::new().fg(t.fg).bg(bg).add_modifier(Modifier::BOLD);
@@ -1070,16 +1158,27 @@ impl App {
         };
         // No speaker labels. Your text and the assistant's text differ by colour.
         // Core notices (approvals, failures) show inline in a dim italic style.
+        // The assistant's text renders as markdown. Your text and notices stay plain.
         let says: Vec<Line> = self
             .says
             .iter()
-            .map(|s| {
-                let style = match s.who.as_str() {
-                    "you" => Style::new().fg(t.accent),
-                    "asst" => Style::new().fg(t.good),
-                    _ => Style::new().fg(t.warn).add_modifier(Modifier::ITALIC),
-                };
-                Line::styled(s.text.clone(), style)
+            .flat_map(|s| match s.who.as_str() {
+                "asst" => markdown_lines(&s.text, &t),
+                "you" => s
+                    .text
+                    .split('\n')
+                    .map(|l| Line::styled(l.to_string(), Style::new().fg(t.accent)))
+                    .collect(),
+                _ => s
+                    .text
+                    .split('\n')
+                    .map(|l| {
+                        Line::styled(
+                            l.to_string(),
+                            Style::new().fg(t.warn).add_modifier(Modifier::ITALIC),
+                        )
+                    })
+                    .collect(),
             })
             .collect();
         pane(
@@ -1436,4 +1535,28 @@ pub async fn run(cfg: crate::core::Config, key: String, cwd: PathBuf) -> anyhow:
     let _ = execute!(io::stdout(), DisableFocusChange, DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    #[test]
+    fn markers_are_removed_and_text_kept() {
+        let t = THEMES[0];
+        let spans = inline_spans("a **b** *c* `d`", Style::new(), &t);
+        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(text, "a b c d");
+    }
+
+    #[test]
+    fn fenced_code_and_bullets_render() {
+        let t = THEMES[0];
+        let lines = markdown_lines("# Title\n- item\n```\nlet x = 1;\n```", &t);
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert_eq!(text[0], "Title");
+        assert!(text[1].contains("• item"));
+        assert!(text[2].contains("let x = 1;"));
+        assert_eq!(text.len(), 3);
+    }
 }
