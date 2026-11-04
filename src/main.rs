@@ -60,6 +60,7 @@ async fn selftest(key: &str) -> Result<()> {
     let s = live::Settings {
         model: core::Config::default().live_model,
         voice: "Kore".into(),
+        hal: false,
     };
     let samples = live::once(key, &s, "Say hello in one short sentence.").await?;
     println!(

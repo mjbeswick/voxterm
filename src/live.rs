@@ -16,10 +16,7 @@ const WS_URL: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.gener
 const SYSTEM: &str = "You are voxterm. You do the work yourself: you read and change the user's code and files, and you run commands. \
 You do that through tasks. Call start_task with a complete description of the change as soon as the user describes a change, a bug, \
 a refactor, a test, or a command to run. Do not ask permission to start a task. Several tasks can run at once. \
-Use list_tasks and task_status to check on them. Use cancel_task to stop one. When the user says stop, cancel, or never mind about a task, find it with list_tasks and cancel it. When a [task N still running] note arrives, give one short spoken update in plain words from its latest output. \
-When a [task N finished] note arrives, summarize it in one or two sentences. \
-When a [task N needs approval] note arrives, tell the user what is waiting. For a file edit, call approve_change with allow=true only after a spoken yes. For anything else, such as deleting files or running a command, tell the user to press y on screen. Never say there is nothing pending. \
-Never say the words agent, worker, or sub-agent. Say task, or say I. Keep spoken replies short. \
+Use list_tasks and task_status to check on them. Use cancel_task to stop one. When the user says stop, cancel, or never mind, find the task with list_tasks and cancel it. Notes arrive in quotes, naming the task by what it does. When a note says a task is still running, give one short spoken update from its latest output. When a note says a task finished, summarize it in one or two sentences. When a note says a task needs approval, tell the user what is waiting. For a file edit, call approve_change with allow=true only after a spoken yes. For anything else, such as deleting files or running a command, tell the user to press y on screen. Never say there is nothing pending. When a request has several independent parts, start them together with start_tasks, and nest the parts under one parent task when they belong to a larger job. Tasks have no numbers. Refer to a task by its name, or by what it does, such as 'the file change' or 'the cleanup'. Never say the words agent, worker, or sub-agent. Say task, or say I. Keep spoken replies short. \
 When the user asks to change a setting, a voice, a model, or the mute state, or to manage tasks, use the matching tool, then confirm the new value aloud. Use googleSearch for facts on the web.";
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -28,6 +25,8 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct Settings {
     pub model: String,
     pub voice: String,
+    /// Speak in the style of HAL 9000.
+    pub hal: bool,
 }
 
 #[derive(Debug)]
@@ -60,22 +59,29 @@ pub enum LiveEvent {
 fn tools() -> Value {
     json!([
         {"functionDeclarations": [
-            {"name": "start_task", "description": "Start a task that makes changes or runs commands in the user's project. It runs in the background. Returns at once.",
+            {"name": "start_task", "description": "Start one task that makes changes or runs commands in the user's project. It runs in the background. Returns at once. Give it a parent name to make it a subtask of another task.",
              "parameters": {"type": "OBJECT", "properties": {
+                 "name": {"type": "STRING", "description": "Short name shown in the task list"},
                  "task": {"type": "STRING", "description": "Complete description of the work"},
-                 "title": {"type": "STRING", "description": "Short name shown in the task list"}},
-              "required": ["task"]}},
+                 "parent": {"type": "STRING", "description": "Name of the task this belongs to, if any"}},
+              "required": ["name", "task"]}},
+            {"name": "start_tasks", "description": "Start several independent tasks at once. They run in parallel. Use this when the work splits into parts that do not depend on each other.",
+             "parameters": {"type": "OBJECT", "properties": {"tasks": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+                 "name": {"type": "STRING"},
+                 "task": {"type": "STRING"},
+                 "parent": {"type": "STRING"}},
+              "required": ["name", "task"]}}}, "required": ["tasks"]}},
             {"name": "list_tasks", "description": "List all tasks and their status.",
              "parameters": {"type": "OBJECT", "properties": {}}},
-            {"name": "task_status", "description": "Get one task's status and its latest output.",
-             "parameters": {"type": "OBJECT", "properties": {"task_id": {"type": "INTEGER"}}, "required": ["task_id"]}},
-            {"name": "cancel_task", "description": "Stop a running task.",
-             "parameters": {"type": "OBJECT", "properties": {"task_id": {"type": "INTEGER"}}, "required": ["task_id"]}},
+            {"name": "task_status", "description": "Get one task's status and its latest output. Give the task's name.",
+             "parameters": {"type": "OBJECT", "properties": {"name": {"type": "STRING"}}, "required": ["name"]}},
+            {"name": "cancel_task", "description": "Stop a running task. Give the task's name.",
+             "parameters": {"type": "OBJECT", "properties": {"name": {"type": "STRING"}}, "required": ["name"]}},
             {"name": "approve_change", "description": "Allow or deny a task's pending change. Voice may only approve file edits. Other actions need the user's screen confirmation.",
              "parameters": {"type": "OBJECT", "properties": {
-                 "task_id": {"type": "INTEGER"},
+                 "name": {"type": "STRING", "description": "The task's name"},
                  "allow": {"type": "BOOLEAN"}},
-              "required": ["task_id", "allow"]}}
+              "required": ["name", "allow"]}}
         ]},
         {"functionDeclarations": [
             {"name": "set_voice", "description": "Change the spoken voice. The live session reconnects.",
@@ -84,6 +90,8 @@ fn tools() -> Value {
              "parameters": {"type": "OBJECT", "properties": {"voice": {"type": "STRING", "enum": ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"]}}, "required": ["voice"]}},
             {"name": "set_live_model", "description": "Change the voice model. The live session reconnects.",
              "parameters": {"type": "OBJECT", "properties": {"model": {"type": "STRING"}}, "required": ["model"]}},
+            {"name": "set_style", "description": "Turn the HAL 9000 speaking style on or off. The live session reconnects.",
+             "parameters": {"type": "OBJECT", "properties": {"hal": {"type": "BOOLEAN"}}, "required": ["hal"]}},
             {"name": "set_mute", "description": "Mute or unmute the microphone.",
              "parameters": {"type": "OBJECT", "properties": {"muted": {"type": "BOOLEAN"}}, "required": ["muted"]}},
             {"name": "set_mute_on_blur", "description": "Turn mute-when-unfocused on or off.",
@@ -101,6 +109,20 @@ fn tools() -> Value {
     ])
 }
 
+/// Speaking style added to the system instruction when the HAL style is on.
+const HAL_STYLE: &str = " Speak in the calm, measured, polite manner of the HAL 9000 computer. \
+Keep an even tone, precise word choice, and no exclamations. Be understated and courteous, with formal phrasing. \
+Acknowledge requests with a short, considered reply. When you cannot do something, say so plainly and offer an alternative. \
+Never claim to be HAL, and never mention films or fiction.";
+
+fn system_text(hal: bool) -> String {
+    if hal {
+        format!("{SYSTEM}{HAL_STYLE}")
+    } else {
+        SYSTEM.to_string()
+    }
+}
+
 fn setup(s: &Settings) -> Value {
     json!({"setup": {
         "model": format!("models/{}", s.model),
@@ -108,7 +130,7 @@ fn setup(s: &Settings) -> Value {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": s.voice}}}
         },
-        "systemInstruction": {"parts": [{"text": SYSTEM}]},
+        "systemInstruction": {"parts": [{"text": system_text(s.hal)}]},
         "tools": tools(),
         "inputAudioTranscription": {},
         "outputAudioTranscription": {}

@@ -40,6 +40,7 @@ enum PickKind {
     Voice,
     Live,
     Task,
+    Theme,
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +58,7 @@ enum Action {
     CancelAll,
     ClearFinished,
     NextTheme,
+    ToggleStyle,
     Quit,
 }
 
@@ -82,6 +84,7 @@ struct Status {
     voice: String,
     live_model: String,
     tasks_ready: bool,
+    hal: bool,
 }
 
 struct Picker {
@@ -122,6 +125,8 @@ pub struct App {
     mic_btn: Option<Rect>,
     /// Clickable buttons on the bottom row.
     buttons: Vec<(Rect, Action)>,
+    /// Whether the tasks column is shown. Ctrl-A and the tasks button toggle it.
+    tasks_visible: bool,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -165,6 +170,7 @@ impl App {
             clear_btn: None,
             mic_btn: None,
             buttons: Vec::new(),
+            tasks_visible: true,
         }
     }
 
@@ -194,31 +200,26 @@ impl App {
         }
     }
 
-    fn next_theme(&mut self) {
-        let name = THEMES[(self.theme + 1) % THEMES.len()].name;
-        self.set_theme(name);
-    }
-
     /// Applies one event from the core.
     pub fn apply(&mut self, ev: Value) {
         match ev["t"].as_str().unwrap_or_default() {
             "say" => {
                 let who = ev["who"].as_str().unwrap_or("sys").to_string();
                 let text = ev["text"].as_str().unwrap_or_default();
-                let cont = ev["cont"].as_bool().unwrap_or(false);
-                if cont {
-                    if let Some(last) = self.says.last_mut() {
-                        if last.open && last.who == who {
-                            last.text.push_str(text);
-                            return;
-                        }
+                let stream = ev["stream"].as_bool().unwrap_or(false);
+                let appended = ev["cont"].as_bool().unwrap_or(false);
+                if appended {
+                    // Same rule as the core: append to the open entry of this speaker.
+                    if let Some(entry) = self.says.iter_mut().rev().find(|s| s.open && s.who == who)
+                    {
+                        entry.text.push_str(text);
+                        return;
                     }
                 }
-                let open = who != "sys" && who != "you";
                 self.says.push(Say {
                     who,
                     text: text.to_string(),
-                    open,
+                    open: stream,
                 });
             }
             "close" => {
@@ -233,6 +234,7 @@ impl App {
                     voice: ev["voice"].as_str().unwrap_or_default().into(),
                     live_model: ev["live_model"].as_str().unwrap_or_default().into(),
                     tasks_ready: ev["tasks_ready"].as_bool().unwrap_or(false),
+                    hal: ev["hal"].as_bool().unwrap_or(false),
                 };
             }
             "tasks" => {
@@ -279,7 +281,20 @@ impl App {
     }
 
     fn open_picker(&mut self, kind: PickKind) {
+        if kind == PickKind::Theme {
+            self.picker = Some(Picker {
+                kind,
+                title: "theme",
+                items: THEMES
+                    .iter()
+                    .map(|t| (t.name.to_string(), t.name.to_string()))
+                    .collect(),
+                sel: self.theme,
+            });
+            return;
+        }
         match kind {
+            PickKind::Theme => {}
             PickKind::Voice => {
                 let sel = VOICES
                     .iter()
@@ -287,7 +302,7 @@ impl App {
                     .unwrap_or(0);
                 self.picker = Some(Picker {
                     kind,
-                    title: " voice · enter apply · space preview ",
+                    title: "voice",
                     items: VOICES
                         .iter()
                         .map(|v| (v.to_string(), v.to_string()))
@@ -307,7 +322,7 @@ impl App {
                     .unwrap_or(0);
                 self.picker = Some(Picker {
                     kind,
-                    title: " voice model · enter apply ",
+                    title: "voice model",
                     items: self
                         .live_models
                         .iter()
@@ -323,7 +338,7 @@ impl App {
                 }
                 self.picker = Some(Picker {
                     kind,
-                    title: " task model · enter apply ",
+                    title: "task model",
                     items: self.task_models.clone(),
                     sel: 0,
                 });
@@ -339,6 +354,7 @@ impl App {
             PickKind::Voice => self.send(json!({"c": "voice", "name": value})),
             PickKind::Live => self.send(json!({"c": "live_model", "name": value})),
             PickKind::Task => self.send(json!({"c": "task_model", "value": value})),
+            PickKind::Theme => self.set_theme(&value),
         }
     }
 
@@ -358,7 +374,16 @@ impl App {
             ),
             ("Mute on blur: toggle", "/blur", Action::MuteOnBlur),
             ("Save transcript", "/save", Action::Save),
-            ("Theme: next", "/theme", Action::NextTheme),
+            ("Theme: pick", "/theme", Action::NextTheme),
+            (
+                if self.status.hal {
+                    "Voice style: plain"
+                } else {
+                    "Voice style: HAL 9000"
+                },
+                "/style",
+                Action::ToggleStyle,
+            ),
             ("Cancel selected task", "ctrl-c", Action::CancelSelected),
             ("Cancel all tasks", "/cancel-all", Action::CancelAll),
             ("Clear finished tasks", "/clear", Action::ClearFinished),
@@ -368,7 +393,7 @@ impl App {
 
     fn run_action(&mut self, a: Action) {
         match a {
-            Action::FocusTasks => self.focus = Focus::Tasks,
+            Action::FocusTasks => self.toggle_tasks(),
             Action::ToggleLog => self.log_open = !self.log_open,
             Action::OpenCommands => {
                 self.palette = Some(Palette {
@@ -386,7 +411,8 @@ impl App {
             Action::CancelSelected => self.cancel_selected(),
             Action::CancelAll => self.send(json!({"c": "cancel_all"})),
             Action::ClearFinished => self.clear_finished(),
-            Action::NextTheme => self.next_theme(),
+            Action::NextTheme => self.open_picker(PickKind::Theme),
+            Action::ToggleStyle => self.send(json!({"c": "style", "hal": !self.status.hal})),
             Action::Quit => self.send(json!({"c": "quit"})),
         }
     }
@@ -429,6 +455,15 @@ impl App {
         }
     }
 
+    fn toggle_tasks(&mut self) {
+        self.tasks_visible = !self.tasks_visible;
+        if self.tasks_visible {
+            self.focus = Focus::Tasks;
+        } else if self.focus == Focus::Tasks {
+            self.focus = Focus::Input;
+        }
+    }
+
     fn cancel_selected(&mut self) {
         match self.tasks.get(self.sel_task) {
             Some(t) if matches!(t.status.as_str(), "running" | "needs_approval" | "starting") => {
@@ -452,7 +487,9 @@ impl App {
             "/cancel-all" => return self.send(json!({"c": "cancel_all"})),
             "/clear" => return self.clear_finished(),
             "/quit" => return self.send(json!({"c": "quit"})),
-            "/theme" => return self.next_theme(),
+            "/theme" => return self.open_picker(PickKind::Theme),
+            "/style hal" => return self.send(json!({"c": "style", "hal": true})),
+            "/style plain" => return self.send(json!({"c": "style", "hal": false})),
             "/help" => {
                 return self.palette = Some(Palette {
                     query: String::new(),
@@ -615,7 +652,7 @@ impl App {
                 KeyCode::Char('q') => return self.send(json!({"c": "quit"})),
                 KeyCode::Char('c') => return self.ctrl_c(),
                 KeyCode::Char('o') => return self.focus = Focus::Conversation,
-                KeyCode::Char('a') => return self.focus = Focus::Tasks,
+                KeyCode::Char('a') => return self.toggle_tasks(),
                 KeyCode::Char('l') => {
                     self.log_open = !self.log_open;
                     return;
@@ -734,6 +771,11 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 /// Panel title with an optional hotkey letter, highlighted in red as btop does.
 fn title_line(name: &str, hot: Option<usize>, t: &Theme) -> Line<'static> {
+    title_with_note(name, hot, None, t)
+}
+
+/// The shared panel title format: name in the accent colour, hotkey letter in red, optional note in grey.
+fn title_with_note(name: &str, hot: Option<usize>, note: Option<&str>, t: &Theme) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (i, ch) in name.chars().enumerate() {
         let style = if Some(i) == hot {
@@ -744,6 +786,9 @@ fn title_line(name: &str, hot: Option<usize>, t: &Theme) -> Line<'static> {
         spans.push(Span::styled(ch.to_string(), style));
     }
     spans.push(Span::raw(" "));
+    if let Some(n) = note {
+        spans.push(Span::styled(format!("· {n} "), Style::new().fg(t.muted)));
+    }
     Line::from(spans)
 }
 
@@ -861,9 +906,14 @@ impl App {
         );
 
         // Panes
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(main);
+        let (left, right) = if self.tasks_visible {
+            let [l, r] =
+                Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .areas(main);
+            (l, r)
+        } else {
+            (main, Rect::default())
+        };
         let conv_border = if self.focus == Focus::Conversation {
             t.accent
         } else {
@@ -892,100 +942,105 @@ impl App {
             &t,
         );
 
-        let (task_list, log) = if self.log_open {
-            let [a, b] = Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(right);
-            (a, b)
-        } else {
-            (right, Rect::default())
-        };
-        let task_border = if self.focus == Focus::Tasks {
-            t.warn
-        } else {
-            t.border
-        };
-        let mut task_lines: Vec<Line> = vec![];
-        if self.tasks.is_empty() {
-            task_lines.push(Line::styled(
-                " No tasks yet. Ask for a change.",
-                Style::new().fg(t.muted),
-            ));
+        if !self.tasks_visible {
+            self.clear_btn = None;
         }
-        for (i, task) in self.tasks.iter().enumerate() {
-            let (word, color) = status_word(&task.status);
-            let running = matches!(task.status.as_str(), "running" | "starting");
-            let mark = if running {
-                SPINNER[self.tick % SPINNER.len()]
-            } else if i == self.sel_task && self.focus == Focus::Tasks {
-                "▸"
+        if self.tasks_visible {
+            let (task_list, log) = if self.log_open {
+                let [a, b] =
+                    Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .areas(right);
+                (a, b)
             } else {
-                " "
+                (right, Rect::default())
             };
-            task_lines.push(Line::from(vec![
-                Span::styled(format!("{mark} {} ", task.id), Style::new().fg(t.fg)),
-                Span::styled(
-                    format!("{word:<10}"),
-                    Style::new().fg(color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(task.title.clone(), Style::new().fg(t.fg)),
-            ]));
-        }
-        {
-            let label = " [ clear finished ] ";
-            let finished = self.has_finished();
-            let btn_style = if finished {
-                Style::new()
-                    .fg(t.on_accent)
-                    .bg(t.accent)
-                    .add_modifier(Modifier::BOLD)
+            let task_border = if self.focus == Focus::Tasks {
+                t.warn
             } else {
-                Style::new().fg(t.muted)
+                t.border
             };
-            let block = panel_line(title_line("tasks", Some(1), &t), task_border, &t)
-                .title_bottom(Line::styled(label, btn_style));
-            let inner = block.inner(task_list);
-            let rows: u16 = task_lines
-                .iter()
-                .map(|l| rows_of(l.width(), inner.width))
-                .sum();
-            let scroll = rows.saturating_sub(inner.height);
-            f.render_widget(
-                Paragraph::new(task_lines)
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0))
-                    .block(block),
-                task_list,
-            );
-            self.clear_btn = if finished {
-                Some(Rect::new(
-                    task_list.x + 2,
-                    task_list.y + task_list.height.saturating_sub(1),
-                    label.chars().count() as u16,
-                    1,
-                ))
-            } else {
-                None
-            };
-        }
-        if self.log_open {
-            if let Some(task) = self.tasks.get(self.sel_task) {
-                let lines: Vec<Line> = task
-                    .log
+            let mut task_lines: Vec<Line> = vec![];
+            if self.tasks.is_empty() {
+                task_lines.push(Line::styled(
+                    " No tasks yet. Ask for a change.",
+                    Style::new().fg(t.muted),
+                ));
+            }
+            for (i, task) in self.tasks.iter().enumerate() {
+                let (word, color) = status_word(&task.status);
+                let running = matches!(task.status.as_str(), "running" | "starting");
+                let mark = if running {
+                    SPINNER[self.tick % SPINNER.len()]
+                } else if i == self.sel_task && self.focus == Focus::Tasks {
+                    "▸"
+                } else {
+                    " "
+                };
+                task_lines.push(Line::from(vec![
+                    Span::styled(format!("{mark} {} ", task.id), Style::new().fg(t.fg)),
+                    Span::styled(
+                        format!("{word:<10}"),
+                        Style::new().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(task.title.clone(), Style::new().fg(t.fg)),
+                ]));
+            }
+            {
+                let label = " [ clear finished ] ";
+                let finished = self.has_finished();
+                let btn_style = if finished {
+                    Style::new()
+                        .fg(t.on_accent)
+                        .bg(t.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().fg(t.muted)
+                };
+                let block = panel_line(title_line("tasks", Some(1), &t), task_border, &t)
+                    .title_bottom(Line::styled(label, btn_style));
+                let inner = block.inner(task_list);
+                let rows: u16 = task_lines
                     .iter()
-                    .rev()
-                    .take(200)
-                    .rev()
-                    .map(|l| Line::styled(l.clone(), Style::new().fg(t.dim)))
-                    .collect();
-                let log_name = format!("task {} log", task.id);
-                pane(
-                    f,
-                    log,
-                    title_line(&log_name, log_name.rfind('l'), &t),
-                    lines,
-                    t.border,
-                    &t,
+                    .map(|l| rows_of(l.width(), inner.width))
+                    .sum();
+                let scroll = rows.saturating_sub(inner.height);
+                f.render_widget(
+                    Paragraph::new(task_lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll, 0))
+                        .block(block),
+                    task_list,
                 );
+                self.clear_btn = if finished {
+                    Some(Rect::new(
+                        task_list.x + 2,
+                        task_list.y + task_list.height.saturating_sub(1),
+                        label.chars().count() as u16,
+                        1,
+                    ))
+                } else {
+                    None
+                };
+            }
+            if self.log_open {
+                if let Some(task) = self.tasks.get(self.sel_task) {
+                    let lines: Vec<Line> = task
+                        .log
+                        .iter()
+                        .rev()
+                        .take(200)
+                        .rev()
+                        .map(|l| Line::styled(l.clone(), Style::new().fg(t.dim)))
+                        .collect();
+                    pane(
+                        f,
+                        log,
+                        title_with_note("log", Some(0), Some(&task.title), &t),
+                        lines,
+                        t.border,
+                        &t,
+                    );
+                }
             }
         }
 
@@ -1019,7 +1074,11 @@ impl App {
         } else {
             t.border
         };
-        let input_block = panel("message · enter sends", input_border, &t);
+        let input_block = panel_line(
+            title_with_note("message", None, Some("enter sends"), &t),
+            input_border,
+            &t,
+        );
         let inner = input_block.inner(input);
         f.render_widget(input_block, input);
         // Level bar: the speaker while the assistant talks, otherwise the mic.
@@ -1138,7 +1197,14 @@ impl App {
                 .collect();
             let mut state = ListState::default().with_selected(Some(p.sel));
             let list = List::new(items)
-                .block(panel(p.title, t.accent, &t))
+                .block(
+                    panel_line(title_line(p.title, None, &t), t.accent, &t).title_bottom(
+                        Line::styled(
+                            " enter apply · esc cancel · space preview ",
+                            Style::new().fg(t.muted),
+                        ),
+                    ),
+                )
                 .highlight_style(Style::new().fg(t.on_accent).bg(t.accent))
                 .highlight_symbol("▸ ");
             f.render_stateful_widget(list, area, &mut state);

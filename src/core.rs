@@ -31,6 +31,9 @@ pub struct Config {
     pub echo_gate: Option<bool>,
     pub echo_tail_ms: u64,
     pub mic_min_rms: f32,
+    /// Voice style: HAL 9000 manner.
+    #[serde(default)]
+    pub hal_style: bool,
 }
 
 impl Default for Config {
@@ -43,6 +46,7 @@ impl Default for Config {
             echo_gate: None,
             echo_tail_ms: 600,
             mic_min_rms: 0.0,
+            hal_style: false,
         }
     }
 }
@@ -102,6 +106,8 @@ struct Task {
     last_update: Instant,
     /// Set once the first progress note has been spoken.
     noted: bool,
+    /// Parent task id, for subtasks.
+    parent: Option<u32>,
 }
 
 pub struct Core {
@@ -115,8 +121,10 @@ pub struct Core {
     tasks: Vec<Task>,
     next_id: u32,
     by_sid: HashMap<String, u32>,
-    transcript: Vec<(String, String)>,
-    open: bool,
+    transcript: Vec<(String, String, bool)>,
+    suppress_asst: bool,
+    /// Notes for the voice model, held until it is quiet. Sending mid-reply would interrupt it.
+    pending_notes: Vec<String>,
     live_status: String,
     manual_mute: bool,
     focused: bool,
@@ -125,6 +133,21 @@ pub struct Core {
     last_tasks: String,
     live_models: Vec<String>,
     worker_models: Vec<(String, String)>,
+}
+
+/// Assistant text that carries tool-call syntax is never shown or spoken.
+fn looks_like_tool_text(text: &str) -> bool {
+    [
+        "response:",
+        "{result:",
+        "functionResponses",
+        "start_task{",
+        "{status:",
+        "task_id",
+        "functionCall",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -233,7 +256,8 @@ pub async fn run(
         next_id: 1,
         by_sid: HashMap::new(),
         transcript: vec![],
-        open: false,
+        suppress_asst: false,
+        pending_notes: Vec::new(),
         live_status: "live: connecting".into(),
         manual_mute: false,
         focused: true,
@@ -257,6 +281,7 @@ pub async fn run(
                 core.emit_status();
                 core.emit_levels();
                 core.progress_updates();
+                core.flush_notes();
             }
         }
     }
@@ -283,6 +308,7 @@ fn settings_of(c: &Config) -> Settings {
     Settings {
         model: c.live_model.clone(),
         voice: c.voice.clone(),
+        hal: c.hal_style,
     }
 }
 
@@ -305,22 +331,40 @@ impl Core {
             .send(LiveCmd::Reconfigure(settings_of(&self.cfg)));
     }
 
-    /// Adds transcript text. `cont` appends to the open entry of the same speaker.
+    /// Adds transcript text. A streamed chunk (`cont`) appends to the open entry of the same
+    /// speaker, even when the other speaker has spoken in between.
     fn say(&mut self, who: &str, text: &str, cont: bool) {
-        let cont = cont && self.open && self.transcript.last().is_some_and(|(w, _)| w == who);
-        if cont {
-            if let Some(last) = self.transcript.last_mut() {
-                last.1.push_str(text);
+        if who == "asst" {
+            if self.suppress_asst || looks_like_tool_text(text) {
+                self.suppress_asst = true;
+                return;
             }
-        } else {
-            self.transcript.push((who.to_string(), text.to_string()));
         }
-        self.open = cont || who != "sys" && who != "you";
-        self.emit(json!({"t": "say", "who": who, "text": text, "cont": cont}));
+        let appended = cont
+            && match self
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|(w, _, open)| *open && w == who)
+            {
+                Some(entry) => {
+                    entry.1.push_str(text);
+                    true
+                }
+                None => false,
+            };
+        if !appended {
+            self.transcript
+                .push((who.to_string(), text.to_string(), cont));
+        }
+        self.emit(json!({"t": "say", "who": who, "text": text, "stream": cont, "cont": appended}));
     }
 
     fn close(&mut self) {
-        self.open = false;
+        for entry in self.transcript.iter_mut() {
+            entry.2 = false;
+        }
+        self.suppress_asst = false;
         self.emit(json!({"t": "close"}));
     }
 
@@ -349,8 +393,7 @@ impl Core {
                     .map(|l| l.trim_start_matches("· ").to_string())
                     .unwrap_or_default();
                 notes.push(format!(
-                    "[task {} still running after {secs}s: {}. Latest output: {}]",
-                    t.id,
+                    "[\"{}\" still running after {secs}s. Latest output: {}]",
                     t.title,
                     short(&latest, 200)
                 ));
@@ -401,6 +444,7 @@ impl Core {
             "voice": self.cfg.voice,
             "live_model": self.cfg.live_model,
             "tasks_ready": self.worker.is_some(),
+            "hal": self.cfg.hal_style,
         });
         let s = v.to_string();
         if s != self.last_status {
@@ -417,6 +461,7 @@ impl Core {
                 json!({
                     "id": t.id,
                     "title": t.title,
+                    "parent": t.parent.and_then(|p| self.tasks.iter().find(|x| x.id == p)).map(|x| x.title.clone()),
                     "status": t.status,
                     "approval": t.perm.as_ref().map(|p| p.title.clone()),
                     "kind": t.perm.as_ref().map(|p| p.kind.clone()),
@@ -432,7 +477,24 @@ impl Core {
         }
     }
 
-    fn notice(&self, text: String) {
+    fn notice(&mut self, text: String) {
+        self.pending_notes.push(text);
+    }
+
+    /// True while the assistant is speaking, or was a moment ago.
+    fn assistant_speaking(&self) -> bool {
+        self.last_audio
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(1200))
+    }
+
+    /// Sends held notes as one message, but only when the assistant is not mid-reply.
+    fn flush_notes(&mut self) {
+        if self.pending_notes.is_empty() || self.assistant_speaking() {
+            return;
+        }
+        let text = self.pending_notes.join("\n");
+        crate::dbg(format!("notes sent: {} chars", text.len()));
+        self.pending_notes.clear();
         let _ = self.live_tx.send(LiveCmd::Text(text));
     }
 
@@ -441,7 +503,7 @@ impl Core {
     }
 
     /// Starts a task. Its session is created first, then the prompt is sent.
-    fn start_task(&mut self, title: String, text: String) -> u32 {
+    fn start_task(&mut self, title: String, text: String, parent: Option<u32>) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         self.tasks.push(Task {
@@ -454,6 +516,7 @@ impl Core {
             started: Instant::now(),
             last_update: Instant::now(),
             noted: false,
+            parent,
         });
         self.emit_tasks();
         match self.worker.clone() {
@@ -474,13 +537,24 @@ impl Core {
         id
     }
 
+    /// A short name for a task, used in notes to the voice model. Never a number.
+    fn label(&self, id: u32) -> String {
+        self.tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "the last change".into())
+    }
+
     fn fail_task(&mut self, id: u32, msg: String) {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
             t.status = "failed";
             t.log.push(format!("error: {msg}"));
         }
         self.say("sys", &format!("That change failed: {msg}"), false);
-        self.notice(format!("[task {id} failed] {msg}"));
+        let label = self.label(id);
+        self.notice(format!("[\"{label}\" failed: {msg}]"));
+        self.check_parent_done(id);
         self.emit_tasks();
     }
 
@@ -520,54 +594,134 @@ impl Core {
         Ok(())
     }
 
+    /// Starts one task (or subtask) from tool arguments: `name`, `task`, and an optional `parent`.
+    fn start_from_args(&mut self, args: &Value) -> Result<String, String> {
+        let text = args["task"]
+            .as_str()
+            .filter(|t| !t.trim().is_empty())
+            .ok_or("missing task description")?;
+        let title = args["name"]
+            .as_str()
+            .or_else(|| args["title"].as_str())
+            .map(String::from)
+            .unwrap_or_else(|| short(text, 48));
+        let parent = match args["parent"].as_str().filter(|p| !p.is_empty()) {
+            Some(p) => Some(
+                self.find_task(&json!({"name": p}))
+                    .ok_or_else(|| format!("no task called {p} to nest under"))?,
+            ),
+            None => None,
+        };
+        self.start_task(title.clone(), text.to_string(), parent);
+        Ok(title)
+    }
+
+    /// Tells the voice model when every subtask of a parent has finished.
+    fn check_parent_done(&mut self, child_id: u32) {
+        let Some(parent) = self
+            .tasks
+            .iter()
+            .find(|t| t.id == child_id)
+            .and_then(|t| t.parent)
+        else {
+            return;
+        };
+        let open = self.tasks.iter().any(|t| {
+            t.parent == Some(parent)
+                && matches!(t.status, "starting" | "running" | "needs_approval")
+        });
+        if !open {
+            let label = self.label(parent);
+            self.notice(format!("[all the parts of \"{label}\" are finished]"));
+        }
+    }
+
+    /// Finds a task from a voice tool's `name` argument. Exact matches win, then partial ones.
+    /// Running tasks come before finished ones. `task_id` is accepted for internal callers only.
+    fn find_task(&self, args: &Value) -> Option<u32> {
+        if let Some(id) = args["task_id"].as_u64() {
+            return self.tasks.iter().find(|t| t.id as u64 == id).map(|t| t.id);
+        }
+        let key = args["name"].as_str()?.trim().to_lowercase();
+        if key.is_empty() {
+            return None;
+        }
+        let mut best: Option<(u8, u32)> = None;
+        for t in &self.tasks {
+            let title = t.title.to_lowercase();
+            let score = if title == key {
+                0
+            } else if title.contains(&key) || key.contains(&title) {
+                1
+            } else {
+                continue;
+            };
+            let live = matches!(t.status, "starting" | "running" | "needs_approval");
+            let rank = score * 2 + if live { 0 } else { 1 };
+            if best.is_none_or(|(r, _)| rank < r) {
+                best = Some((rank, t.id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// Tool calls from the voice model.
     fn tool(&mut self, id: String, name: String, args: Value) {
         let result = match name.as_str() {
-            "start_task" => match args["task"].as_str() {
-                Some(text) if !text.trim().is_empty() => {
-                    let title = args["title"]
-                        .as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| short(text, 48));
-                    let n = self.start_task(title, text.to_string());
-                    json!({"task_id": n, "status": "started"})
-                }
-                _ => json!({"error": "missing task description"}),
+            "start_task" => match self.start_from_args(&args) {
+                Ok(name) => json!({"name": name, "status": "started"}),
+                Err(e) => json!({"error": e}),
             },
+            "start_tasks" => {
+                let items = args["tasks"].as_array().cloned().unwrap_or_default();
+                let mut started = vec![];
+                let mut errors = vec![];
+                for item in &items {
+                    match self.start_from_args(item) {
+                        Ok(name) => started.push(name),
+                        Err(e) => errors.push(e),
+                    }
+                }
+                if started.is_empty() {
+                    json!({"error": errors.join("; ")})
+                } else {
+                    json!({"status": "started", "names": started, "errors": errors})
+                }
+            }
             "list_tasks" => json!(
                 self.tasks
                     .iter()
-                    .map(|t| json!({"task_id": t.id, "title": t.title, "status": t.status}))
+                    .map(|t| json!({"name": t.title, "status": t.status}))
                     .collect::<Vec<_>>()
             ),
-            "task_status" => match args["task_id"]
-                .as_u64()
-                .and_then(|n| self.tasks.iter().find(|t| t.id as u64 == n))
-            {
-                Some(t) => json!({
-                    "task_id": t.id,
-                    "status": t.status,
-                    "recent": t.log.iter().rev().take(3).rev().cloned().collect::<Vec<_>>(),
-                    "waiting_for_approval": t.perm.as_ref().map(|p| p.title.clone()),
-                }),
-                None => json!({"error": "no such task"}),
+            "task_status" => match self.find_task(&args) {
+                Some(id) => {
+                    let t = self.tasks.iter().find(|t| t.id == id).expect("found above");
+                    json!({
+                        "name": t.title,
+                        "status": t.status,
+                        "recent": t.log.iter().rev().take(3).rev().cloned().collect::<Vec<_>>(),
+                        "waiting_for_approval": t.perm.as_ref().map(|p| p.title.clone()),
+                    })
+                }
+                None => json!({"error": "no task with that name"}),
             },
             "cancel_task" => {
-                let sid = args["task_id"]
-                    .as_u64()
-                    .and_then(|n| self.tasks.iter().find(|t| t.id as u64 == n))
+                let sid = self
+                    .find_task(&args)
+                    .and_then(|id| self.tasks.iter().find(|t| t.id == id))
                     .and_then(|t| t.sid.clone());
                 match (sid, &self.worker) {
                     (Some(sid), Some(w)) => {
                         let _ = w.send(WCmd::Cancel { sid });
                         json!({"status": "cancel requested"})
                     }
-                    _ => json!({"error": "task is not running"}),
+                    _ => json!({"error": "that task is not running"}),
                 }
             }
             "approve_change" => {
                 let allow = args["allow"].as_bool().unwrap_or(false);
-                let tid = args["task_id"].as_u64().unwrap_or(0);
+                let tid = self.find_task(&args).unwrap_or(0) as u64;
                 let kind = self
                     .tasks
                     .iter()
@@ -606,6 +760,9 @@ impl Core {
                 },
                 None => json!({"error": "missing model"}),
             },
+            "set_style" => {
+                json!({"status": self.set_hal_style(args["hal"].as_bool().unwrap_or(false))})
+            }
             "set_mute" => json!({"status": self.set_mute(args["muted"].as_bool().unwrap_or(true))}),
             "set_mute_on_blur" => {
                 json!({"status": self.set_mute_on_blur(args["on"].as_bool().unwrap_or(true))})
@@ -641,10 +798,14 @@ impl Core {
             LiveEvent::User(t) => self.say("you", &t, true),
             LiveEvent::Assistant(t) => self.say("asst", &t, true),
             LiveEvent::Interrupted => {
+                crate::dbg("live: interrupted");
                 let _ = self.audio.send(AudioCmd::Flush);
                 self.close();
             }
-            LiveEvent::TurnComplete => self.close(),
+            LiveEvent::TurnComplete => {
+                self.close();
+                self.flush_notes();
+            }
             LiveEvent::Call { id, name, args } => self.tool(id, name, args),
         }
     }
@@ -694,7 +855,7 @@ impl Core {
                         false,
                     );
                     self.notice(format!(
-                        "[task {id} needs approval: {title} ({kind}). If it is a file edit and the user says yes aloud, call approve_change. Otherwise tell the user to press y on screen.]"
+                        "[\"{}\" needs approval: {title} ({kind}). If it is a file edit and the user says yes aloud, call approve_change. Otherwise tell the user to press y on screen.]", self.label(id)
                     ));
                 }
                 self.emit_tasks();
@@ -707,14 +868,16 @@ impl Core {
                         t.perm = None;
                         t.log.push(format!("finished ({stop})"));
                     }
+                    self.check_parent_done(id);
                     if cancelled {
-                        self.notice(format!("[task {id} cancelled]"));
+                        let label = self.label(id);
+                        self.notice(format!("[\"{label}\" was cancelled]"));
                     } else {
                         let tail = tail_chars(&text, 1500);
                         let msg = if tail.trim().is_empty() {
-                            format!("[task {id} finished] no text output")
+                            format!("[\"{}\" finished, no text output]", self.label(id))
                         } else {
-                            format!("[task {id} finished] {tail}")
+                            format!("[\"{}\" finished] {tail}", self.label(id))
                         };
                         self.notice(msg);
                     }
@@ -813,6 +976,20 @@ impl Core {
         Ok(format!("live model set to {name}"))
     }
 
+    fn set_hal_style(&mut self, on: bool) -> String {
+        self.cfg.hal_style = on;
+        self.cfg.save();
+        self.reconfigure();
+        let msg = if on {
+            "voice style: HAL 9000. Live session reconnects; context resets"
+        } else {
+            "voice style: plain. Live session reconnects; context resets"
+        };
+        self.say("sys", msg, false);
+        self.emit_status();
+        msg.to_string()
+    }
+
     fn set_mute(&mut self, on: bool) -> String {
         self.manual_mute = on;
         self.apply_mic();
@@ -841,6 +1018,7 @@ impl Core {
         let s = Settings {
             model: self.cfg.live_model.clone(),
             voice: name.to_string(),
+            hal: self.cfg.hal_style,
         };
         let text = format!("Hi, I'm {name}. This is how I sound.");
         let key = self.key.clone();
@@ -887,6 +1065,10 @@ impl Core {
                     self.say("you", text, false);
                     let _ = self.live_tx.send(LiveCmd::Text(text.to_string()));
                 }
+            }
+            "style" => {
+                let on = v["hal"].as_bool().unwrap_or(false);
+                self.set_hal_style(on);
             }
             "mute" => {
                 let on = v["on"].as_bool().unwrap_or(false);
@@ -966,7 +1148,7 @@ impl Core {
             .unwrap_or_default()
             .join(format!("voxterm-{stamp}.md"));
         let mut out = String::from("# voxterm transcript\n\n## Conversation\n\n");
-        for (who, text) in &self.transcript {
+        for (who, text, _) in &self.transcript {
             out.push_str(&format!("- **{who}:** {text}\n"));
         }
         out.push_str("\n## Tasks\n\n");
