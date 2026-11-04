@@ -783,12 +783,15 @@ impl App {
             .says
             .iter()
             .map(|s| {
+                // Task messages get their own label and colour, apart from the assistant.
+                let is_task = s.who == "sys" && s.text.starts_with("task");
                 let (label, lc) = match s.who.as_str() {
-                    "you" => ("you ", t.accent),
+                    "you" => ("you ", t.special),
                     "asst" => ("asst", t.good),
+                    _ if is_task => ("task", t.warn),
                     _ => ("sys ", t.muted),
                 };
-                let tc = if s.who == "sys" { t.muted } else { t.fg };
+                let tc = if s.who == "sys" && !is_task { t.muted } else { t.fg };
                 Line::from(vec![
                     Span::styled(
                         format!("{label}  "),
