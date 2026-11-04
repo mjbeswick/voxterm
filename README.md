@@ -28,7 +28,7 @@ Everything is Rust. The terminal UI is ratatui, and the core runs in the same pr
 
 ## Keys
 
-No function keys. Type to talk. Commands run from the palette or as slash words.
+No function keys. Type to talk. Commands run from the palette, from the buttons on the bottom row, or as slash words. Click a button or the state chip in the header to use it with the mouse.
 
 | Key | Action |
 |---|---|

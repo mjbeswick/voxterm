@@ -44,6 +44,9 @@ enum PickKind {
 
 #[derive(Clone, Copy)]
 enum Action {
+    FocusTasks,
+    ToggleLog,
+    OpenCommands,
     Voice,
     LiveModel,
     TaskModel,
@@ -117,6 +120,8 @@ pub struct App {
     clear_btn: Option<Rect>,
     /// Header state chip. Clicking it toggles the mic.
     mic_btn: Option<Rect>,
+    /// Clickable buttons on the bottom row.
+    buttons: Vec<(Rect, Action)>,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -159,6 +164,7 @@ impl App {
             tick: 0,
             clear_btn: None,
             mic_btn: None,
+            buttons: Vec::new(),
         }
     }
 
@@ -362,6 +368,15 @@ impl App {
 
     fn run_action(&mut self, a: Action) {
         match a {
+            Action::FocusTasks => self.focus = Focus::Tasks,
+            Action::ToggleLog => self.log_open = !self.log_open,
+            Action::OpenCommands => {
+                self.palette = Some(Palette {
+                    query: String::new(),
+                    sel: 0,
+                    slash: false,
+                })
+            }
             Action::Voice => self.open_picker(PickKind::Voice),
             Action::LiveModel => self.open_picker(PickKind::Live),
             Action::TaskModel => self.open_picker(PickKind::Task),
@@ -403,6 +418,13 @@ impl App {
                 self.clear_finished();
             } else if self.mic_btn.is_some_and(inside) {
                 self.send(json!({"c": "mute", "on": self.status.mic}));
+            } else if let Some(action) = self
+                .buttons
+                .iter()
+                .find(|(r, _)| inside(*r))
+                .map(|(_, a)| *a)
+            {
+                self.run_action(action);
             }
         }
     }
@@ -1021,22 +1043,46 @@ impl App {
             ));
         }
 
-        // Hint line
-        let hint_text = if !self.note.is_empty() {
-            self.note.clone()
-        } else {
-            match self.focus {
-                Focus::Tasks => {
-                    "↑↓ select · enter open log · ctrl-c cancel task · ctrl-o chat · ctrl-l log · ctrl-k all commands".into()
-                }
-                Focus::Conversation => "ctrl-a tasks · ctrl-l log · ctrl-t mute mic (or click the state) · ctrl-k all commands · ctrl-q quit".into(),
-                Focus::Input => "enter send · ctrl-a tasks · ctrl-o chat · ctrl-t mute mic · ctrl-k all commands · ctrl-q quit".into(),
+        // Bottom row: clickable buttons. Each shows the key that does the same thing.
+        let buttons_def: Vec<(&str, &str, Action)> = vec![
+            ("mute", "^T", Action::ToggleMute),
+            ("tasks", "^A", Action::FocusTasks),
+            ("log", "^L", Action::ToggleLog),
+            ("commands", "^K", Action::OpenCommands),
+            ("save", "/save", Action::Save),
+            ("quit", "^Q", Action::Quit),
+        ];
+        self.buttons.clear();
+        let mut x = hint.x;
+        let mut spans: Vec<Span> = Vec::new();
+        for (label, key, action) in buttons_def {
+            let text = format!(" {label} {key} ");
+            let w = text.chars().count() as u16;
+            if x + w > hint.x + hint.width {
+                break;
             }
+            self.buttons.push((Rect::new(x, hint.y, w, 1), action));
+            spans.push(Span::styled(
+                text,
+                Style::new()
+                    .fg(t.fg)
+                    .bg(t.header_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+            x += w + 1;
+        }
+        let note = if self.note.is_empty() {
+            match self.focus {
+                Focus::Tasks => "↑↓ select · enter log · ctrl-c cancel task".to_string(),
+                Focus::Conversation => "ctrl-o chat · tab moves focus".to_string(),
+                Focus::Input => "enter send · tab moves focus".to_string(),
+            }
+        } else {
+            self.note.clone()
         };
-        f.render_widget(
-            Paragraph::new(hint_text).style(Style::new().fg(t.muted)),
-            hint,
-        );
+        spans.push(Span::styled(note, Style::new().fg(t.muted)));
+        f.render_widget(Paragraph::new(Line::from(spans)), hint);
 
         // Overlays
         if let Some(p) = &self.palette {
