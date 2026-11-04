@@ -818,15 +818,19 @@ impl App {
 }
 
 /// Eight-step block bar for a 0..=100 level.
-fn level_bar(level: u64, width: usize) -> String {
-    const STEPS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let filled = (level as usize * width * 8) / 100;
-    (0..width)
-        .map(|i| {
-            let cell = filled.saturating_sub(i * 8).min(8);
-            STEPS[cell]
-        })
-        .collect()
+/// Braille meter: the newest `width` readings, one braille cell each, rising from the bottom.
+fn braille_meter(hist: &[u64], width: usize) -> String {
+    // Eight fill levels per cell, built from the bottom row of dots of a braille cell.
+    const FILL: [char; 9] = ['⠀', '⡀', '⣀', '⣄', '⣤', '⣦', '⣶', '⣷', '⣿'];
+    let start = hist.len().saturating_sub(width);
+    let mut out: String = std::iter::repeat('⠀')
+        .take(width.saturating_sub(hist.len() - start))
+        .collect();
+    for &v in &hist[start..] {
+        let level = (v.min(100) as usize * 8).div_ceil(100);
+        out.push(FILL[level.min(8)]);
+    }
+    out
 }
 
 fn push_hist(h: &mut Vec<u64>, v: u64) {
@@ -1020,10 +1024,26 @@ impl App {
                 Style::new().fg(t.muted),
             ),
         ]);
+        // Level meter at the right of the header: braille columns, speaker while talking, mic otherwise.
+        let (hist, meter_color) = if self.status.state == "speaking" {
+            (&self.out_hist, t.special)
+        } else {
+            (&self.mic_hist, t.good)
+        };
+        let meter_width = top.width.saturating_sub(40).clamp(0, 30);
+        let [title_area, meter_area] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(meter_width)]).areas(top);
         f.render_widget(
             Paragraph::new(header).style(Style::new().bg(t.header_bg)),
-            top,
+            title_area,
         );
+        if meter_width > 0 {
+            f.render_widget(
+                Paragraph::new(braille_meter(hist, meter_width as usize))
+                    .style(Style::new().fg(meter_color).bg(t.header_bg)),
+                meter_area,
+            );
+        }
 
         // Panes
         let (left, right) = if self.tasks_visible {
@@ -1205,20 +1225,7 @@ impl App {
         );
         let inner = input_block.inner(input);
         f.render_widget(input_block, input);
-        // Level bar: the speaker while the assistant talks, otherwise the mic.
-        let (level, bar_color) = if self.status.state == "speaking" {
-            (self.out_hist.last().copied().unwrap_or(0), t.special)
-        } else {
-            (self.mic_hist.last().copied().unwrap_or(0), t.good)
-        };
-        let bar_width = (inner.width / 4).clamp(6, 24);
-        let [text_area, bar_area] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(bar_width)]).areas(inner);
-        f.render_widget(Paragraph::new(prompt), text_area);
-        f.render_widget(
-            Paragraph::new(level_bar(level, bar_width as usize)).style(Style::new().fg(bar_color)),
-            bar_area,
-        );
+        f.render_widget(Paragraph::new(prompt), inner);
         if self.focus == Focus::Input {
             f.set_cursor_position(Position::new(
                 input.x + 3 + self.input.chars().count() as u16,
