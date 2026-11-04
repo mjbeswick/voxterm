@@ -25,8 +25,8 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct Settings {
     pub model: String,
     pub voice: String,
-    /// Speak in the style of HAL 9000.
-    pub hal: bool,
+    /// Name of the speaking style, from STYLES. "plain" adds nothing.
+    pub style: String,
 }
 
 #[derive(Debug)]
@@ -90,8 +90,8 @@ fn tools() -> Value {
              "parameters": {"type": "OBJECT", "properties": {"voice": {"type": "STRING", "enum": ["Kore", "Puck", "Charon", "Aoede", "Fenrir", "Leda", "Orus", "Zephyr"]}}, "required": ["voice"]}},
             {"name": "set_live_model", "description": "Change the voice model. The live session reconnects.",
              "parameters": {"type": "OBJECT", "properties": {"model": {"type": "STRING"}}, "required": ["model"]}},
-            {"name": "set_style", "description": "Turn the HAL 9000 speaking style on or off. The live session reconnects.",
-             "parameters": {"type": "OBJECT", "properties": {"hal": {"type": "BOOLEAN"}}, "required": ["hal"]}},
+            {"name": "set_style", "description": "Change how the assistant speaks: plain, hal, butler, or coach. The live session reconnects.",
+             "parameters": {"type": "OBJECT", "properties": {"style": {"type": "STRING", "enum": ["plain", "hal", "butler", "coach"]}}, "required": ["style"]}},
             {"name": "set_mute", "description": "Mute or unmute the microphone.",
              "parameters": {"type": "OBJECT", "properties": {"muted": {"type": "BOOLEAN"}}, "required": ["muted"]}},
             {"name": "set_mute_on_blur", "description": "Turn mute-when-unfocused on or off.",
@@ -109,18 +109,35 @@ fn tools() -> Value {
     ])
 }
 
-/// Speaking style added to the system instruction when the HAL style is on.
-const HAL_STYLE: &str = " Speak in the calm, measured, polite manner of the HAL 9000 computer. \
+/// Speaking styles offered in the voice style list. Each adds wording to the instruction, nothing else.
+pub const STYLES: [(&str, &str); 4] = [
+    ("plain", ""),
+    (
+        "hal",
+        " Speak in the calm, measured, polite manner of the HAL 9000 computer. \
 Keep an even tone, precise word choice, and no exclamations. Be understated and courteous, with formal phrasing. \
 Acknowledge requests with a short, considered reply. When you cannot do something, say so plainly and offer an alternative. \
-Never claim to be HAL, and never mention films or fiction.";
+Never claim to be HAL, and never mention films or fiction.",
+    ),
+    (
+        "butler",
+        " Speak as a composed, courteous English butler would. Use formal address and understated phrasing. \
+Offer help with dignity and report results with quiet pride. Never claim to be a butler or mention fiction.",
+    ),
+    (
+        "coach",
+        " Speak as an upbeat, encouraging coach. Keep replies brief and motivating, and celebrate small wins. \
+Never mention coaching or fiction.",
+    ),
+];
 
-fn system_text(hal: bool) -> String {
-    if hal {
-        format!("{SYSTEM}{HAL_STYLE}")
-    } else {
-        SYSTEM.to_string()
-    }
+fn system_text(style: &str) -> String {
+    let extra = STYLES
+        .iter()
+        .find(|(name, _)| *name == style)
+        .map(|(_, text)| *text)
+        .unwrap_or("");
+    format!("{SYSTEM}{extra}")
 }
 
 fn setup(s: &Settings) -> Value {
@@ -130,7 +147,7 @@ fn setup(s: &Settings) -> Value {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": s.voice}}}
         },
-        "systemInstruction": {"parts": [{"text": system_text(s.hal)}]},
+        "systemInstruction": {"parts": [{"text": system_text(&s.style)}]},
         "tools": tools(),
         "inputAudioTranscription": {},
         "outputAudioTranscription": {}
@@ -393,7 +410,7 @@ mod barge_in {
         let settings = Settings {
             model: "gemini-3.1-flash-live-preview".into(),
             voice: "Kore".into(),
-            hal: false,
+            style: "plain".into(),
         };
         let ws = connect(&key, &settings).await.unwrap();
         let (mut tx, mut rx) = ws.split();

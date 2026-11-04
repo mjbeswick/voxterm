@@ -45,6 +45,7 @@ enum PickKind {
     Live,
     Task,
     Theme,
+    Style,
 }
 
 #[derive(Clone, Copy)]
@@ -92,7 +93,7 @@ struct Status {
     voice: String,
     live_model: String,
     tasks_ready: bool,
-    hal: bool,
+    style: String,
 }
 
 struct Picker {
@@ -247,7 +248,7 @@ impl App {
                     voice: ev["voice"].as_str().unwrap_or_default().into(),
                     live_model: ev["live_model"].as_str().unwrap_or_default().into(),
                     tasks_ready: ev["tasks_ready"].as_bool().unwrap_or(false),
-                    hal: ev["hal"].as_bool().unwrap_or(false),
+                    style: ev["style"].as_str().unwrap_or("plain").to_string(),
                 };
             }
             "tasks" => {
@@ -294,6 +295,23 @@ impl App {
     }
 
     fn open_picker(&mut self, kind: PickKind) {
+        if kind == PickKind::Style {
+            let current = self.status.style.clone();
+            self.picker = Some(Picker {
+                kind,
+                title: "voice style",
+                items: crate::live::STYLES
+                    .iter()
+                    .map(|(n, _)| (n.to_string(), n.to_string()))
+                    .collect(),
+                sel: crate::live::STYLES
+                    .iter()
+                    .position(|(n, _)| *n == current)
+                    .unwrap_or(0),
+                origin_theme: self.theme,
+            });
+            return;
+        }
         if kind == PickKind::Theme {
             self.picker = Some(Picker {
                 kind,
@@ -308,7 +326,7 @@ impl App {
             return;
         }
         match kind {
-            PickKind::Theme => {}
+            PickKind::Theme | PickKind::Style => {}
             PickKind::Voice => {
                 let sel = VOICES
                     .iter()
@@ -372,6 +390,7 @@ impl App {
             PickKind::Live => self.send(json!({"c": "live_model", "name": value})),
             PickKind::Task => self.send(json!({"c": "task_model", "value": value})),
             PickKind::Theme => self.set_theme(&value),
+            PickKind::Style => self.send(json!({"c": "style", "name": value})),
         }
     }
 
@@ -393,15 +412,7 @@ impl App {
             ("Save transcript", "/save", Action::Save),
             ("Copy conversation", "/copy", Action::CopyConversation),
             ("Theme: pick", "/theme", Action::NextTheme),
-            (
-                if self.status.hal {
-                    "Voice style: plain"
-                } else {
-                    "Voice style: HAL 9000"
-                },
-                "/style",
-                Action::ToggleStyle,
-            ),
+            ("Voice style: pick", "/style", Action::ToggleStyle),
             ("Cancel selected task", "ctrl-c", Action::CancelSelected),
             ("Cancel all tasks", "/cancel-all", Action::CancelAll),
             ("Clear finished tasks", "/clear", Action::ClearFinished),
@@ -430,7 +441,7 @@ impl App {
             Action::CancelAll => self.send(json!({"c": "cancel_all"})),
             Action::ClearFinished => self.clear_finished(),
             Action::NextTheme => self.open_picker(PickKind::Theme),
-            Action::ToggleStyle => self.send(json!({"c": "style", "hal": !self.status.hal})),
+            Action::ToggleStyle => self.open_picker(PickKind::Style),
             Action::CopyConversation => self.copy_conversation(),
             Action::Quit => self.send(json!({"c": "quit"})),
         }
@@ -537,8 +548,7 @@ impl App {
             "/clear" => return self.clear_finished(),
             "/quit" => return self.send(json!({"c": "quit"})),
             "/theme" => return self.open_picker(PickKind::Theme),
-            "/style hal" => return self.send(json!({"c": "style", "hal": true})),
-            "/style plain" => return self.send(json!({"c": "style", "hal": false})),
+            "/style" => return self.open_picker(PickKind::Style),
             "/help" => {
                 return self.palette = Some(Palette {
                     query: String::new(),
@@ -547,6 +557,9 @@ impl App {
                 });
             }
             _ => {}
+        }
+        if let Some(name) = cmd.strip_prefix("/style ") {
+            return self.send(json!({"c": "style", "name": name.trim()}));
         }
         if let Some(name) = cmd.strip_prefix("/theme ") {
             return self.set_theme(name.trim());
@@ -924,10 +937,6 @@ fn panel_line(title: Line<'static>, color: Color, t: &Theme) -> Block<'static> {
         .title(title)
 }
 
-fn panel(title: &str, color: Color, t: &Theme) -> Block<'static> {
-    panel_line(title_line(title, None, t), color, t)
-}
-
 fn pane(
     f: &mut Frame,
     area: Rect,
@@ -1284,36 +1293,74 @@ impl App {
                 .into_iter()
                 .filter(|(label, _, _)| label.to_lowercase().contains(&q.to_lowercase()))
                 .collect();
-            let h = (items.len() as u16 + 4).min(f.area().height);
-            let area = centered(f.area(), (f.area().width / 2).max(44), h);
+            let h = (items.len() as u16 + 6).min(f.area().height);
+            let area = centered(f.area(), (f.area().width * 3 / 5).max(48), h);
             f.render_widget(Clear, area);
-            let mut lines: Vec<Line> = vec![Line::styled(
-                if p.slash {
-                    format!("/{q}")
-                } else {
-                    format!("› {q}")
-                },
-                Style::new().fg(t.fg),
-            )];
+            let inner_w = area.width.saturating_sub(2) as usize;
+
+            // Filter line: a search prompt, then what is typed.
+            let mut lines: Vec<Line> = vec![Line::from(vec![
+                Span::styled(
+                    if p.slash { "/" } else { "› " },
+                    Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if p.slash { q.clone() } else { p.query.clone() },
+                    Style::new().fg(t.fg),
+                ),
+                Span::styled("▏", Style::new().fg(t.accent)),
+            ])];
+            lines.push(Line::styled("─".repeat(inner_w), Style::new().fg(t.border)));
+
+            // One row per command: label on the left, its key right-aligned.
             for (i, (label, keys, _)) in items.iter().enumerate() {
-                let (fg, bg) = if i == p.sel {
-                    (t.on_accent, t.accent)
-                } else {
-                    (t.dim, t.header_bg)
-                };
-                let mut row = vec![Span::styled(
-                    format!("  {label}   "),
-                    Style::new().fg(fg).bg(bg),
-                )];
+                let selected = i == p.sel;
+                let bg = if selected { t.accent } else { t.header_bg };
+                let fg = if selected { t.on_accent } else { t.fg };
+                let key_len = keys.chars().count();
+                let pad = inner_w.saturating_sub(label.chars().count() + key_len + 3);
+                let mut row = vec![
+                    Span::styled(format!("  {label}"), Style::new().fg(fg).bg(bg)),
+                    Span::styled(" ".repeat(pad), Style::new().bg(bg)),
+                ];
                 row.extend(key_spans(keys, Some(bg), &t));
+                row.push(Span::styled(" ", Style::new().bg(bg)));
                 lines.push(Line::from(row));
             }
-            lines.push(Line::styled(
-                "  ↑↓ move · enter run · esc close",
-                Style::new().fg(t.muted),
-            ));
+
+            // Footer: the controls, as key chips.
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " ↑↓ ",
+                    Style::new()
+                        .fg(t.fg)
+                        .bg(t.header_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" move   ", Style::new().fg(t.muted)),
+                Span::styled(
+                    " enter ",
+                    Style::new()
+                        .fg(t.fg)
+                        .bg(t.header_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" run   ", Style::new().fg(t.muted)),
+                Span::styled(
+                    " esc ",
+                    Style::new()
+                        .fg(t.fg)
+                        .bg(t.header_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" close", Style::new().fg(t.muted)),
+            ]));
             f.render_widget(
-                Paragraph::new(lines).block(panel("commands", t.accent, &t)),
+                Paragraph::new(lines).block(panel_line(
+                    title_with_note("commands", None, Some("type to filter"), &t),
+                    t.accent,
+                    &t,
+                )),
                 area,
             );
         }

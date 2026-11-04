@@ -31,9 +31,9 @@ pub struct Config {
     pub echo_gate: Option<bool>,
     pub echo_tail_ms: u64,
     pub mic_min_rms: f32,
-    /// Voice style: HAL 9000 manner.
-    #[serde(default)]
-    pub hal_style: bool,
+    /// Speaking style name, from live::STYLES.
+    #[serde(default = "default_style")]
+    pub style: String,
 }
 
 impl Default for Config {
@@ -46,7 +46,7 @@ impl Default for Config {
             echo_gate: None,
             echo_tail_ms: 600,
             mic_min_rms: 0.0,
-            hal_style: true,
+            style: "hal".into(),
         }
     }
 }
@@ -304,11 +304,15 @@ fn forward<T: Send + 'static>(
     });
 }
 
+fn default_style() -> String {
+    "hal".into()
+}
+
 fn settings_of(c: &Config) -> Settings {
     Settings {
         model: c.live_model.clone(),
         voice: c.voice.clone(),
-        hal: c.hal_style,
+        style: c.style.clone(),
     }
 }
 
@@ -444,7 +448,7 @@ impl Core {
             "voice": self.cfg.voice,
             "live_model": self.cfg.live_model,
             "tasks_ready": self.worker.is_some(),
-            "hal": self.cfg.hal_style,
+            "style": self.cfg.style,
         });
         let s = v.to_string();
         if s != self.last_status {
@@ -761,7 +765,7 @@ impl Core {
                 None => json!({"error": "missing model"}),
             },
             "set_style" => {
-                json!({"status": self.set_hal_style(args["hal"].as_bool().unwrap_or(false))})
+                json!({"status": self.set_style(args["style"].as_str().unwrap_or("plain"))})
             }
             "set_mute" => json!({"status": self.set_mute(args["muted"].as_bool().unwrap_or(true))}),
             "set_mute_on_blur" => {
@@ -976,18 +980,19 @@ impl Core {
         Ok(format!("live model set to {name}"))
     }
 
-    fn set_hal_style(&mut self, on: bool) -> String {
-        self.cfg.hal_style = on;
+    /// Sets the speaking style. The Live session reconnects so the new instruction takes effect.
+    fn set_style(&mut self, name: &str) -> String {
+        let Some((style, _)) = crate::live::STYLES.iter().find(|(n, _)| *n == name) else {
+            let names: Vec<&str> = crate::live::STYLES.iter().map(|(n, _)| *n).collect();
+            return format!("unknown style. Choose from: {}", names.join(", "));
+        };
+        self.cfg.style = style.to_string();
         self.cfg.save();
         self.reconfigure();
-        let msg = if on {
-            "voice style: HAL 9000. Live session reconnects; context resets"
-        } else {
-            "voice style: plain. Live session reconnects; context resets"
-        };
-        self.say("sys", msg, false);
+        let msg = format!("voice style: {style}. Live session reconnects; context resets");
+        self.say("sys", &msg, false);
         self.emit_status();
-        msg.to_string()
+        msg
     }
 
     fn set_mute(&mut self, on: bool) -> String {
@@ -1018,7 +1023,7 @@ impl Core {
         let s = Settings {
             model: self.cfg.live_model.clone(),
             voice: name.to_string(),
-            hal: self.cfg.hal_style,
+            style: self.cfg.style.clone(),
         };
         let text = format!("Hi, I'm {name}. This is how I sound.");
         let key = self.key.clone();
@@ -1067,8 +1072,9 @@ impl Core {
                 }
             }
             "style" => {
-                let on = v["hal"].as_bool().unwrap_or(false);
-                self.set_hal_style(on);
+                if let Some(name) = v["name"].as_str() {
+                    self.set_style(name);
+                }
             }
             "mute" => {
                 let on = v["on"].as_bool().unwrap_or(false);
