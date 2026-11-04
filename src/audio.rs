@@ -14,6 +14,9 @@ use std::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Latest levels in RMS: (mic, speaker). Read by the core for the UI meters.
+pub static LEVELS: std::sync::Mutex<(f32, f32)> = std::sync::Mutex::new((0.0, 0.0));
+
 pub enum AudioCmd {
     Mic(bool),
     Play(Vec<i16>),
@@ -161,6 +164,7 @@ fn output(
         cfg.config(),
         move |data: &mut [f32], _| {
             let mut sh = shared.lock().unwrap();
+            let mut peak_sq = 0.0f32;
             for frame in data.chunks_mut(ch) {
                 let s = match sh.queue.pop_front() {
                     Some(s) => {
@@ -170,7 +174,14 @@ fn output(
                     None => 0.0,
                 };
                 sh.refq.push_back(s);
+                peak_sq += s * s;
                 frame.iter_mut().for_each(|c| *c = s);
+            }
+            if !data.is_empty() {
+                let level = (peak_sq / data.len().max(1) as f32).sqrt();
+                if let Ok(mut l) = LEVELS.lock() {
+                    l.1 = level;
+                }
             }
             while sh.refq.len() > keep {
                 sh.refq.pop_front();
@@ -239,6 +250,9 @@ fn input(
             };
             let cleaned = aec.process(&refd, &mono);
             let level = rms(&cleaned);
+            if let Ok(mut l) = LEVELS.lock() {
+                l.0 = level;
+            }
             crate::dbg(format!("mic rms {level:.4}"));
             if busy || level < min_rms {
                 buf.clear();

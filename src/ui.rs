@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -107,6 +107,8 @@ pub struct App {
     theme: usize,
     cmd: UnboundedSender<Value>,
     quit: bool,
+    mic_hist: Vec<u64>,
+    out_hist: Vec<u64>,
 }
 
 fn ui_state_path() -> PathBuf {
@@ -144,6 +146,8 @@ impl App {
             theme: load_theme(),
             cmd,
             quit: false,
+            mic_hist: vec![],
+            out_hist: vec![],
         }
     }
 
@@ -219,6 +223,12 @@ impl App {
                 if self.sel_task >= self.tasks.len() {
                     self.sel_task = self.tasks.len().saturating_sub(1);
                 }
+            }
+            "levels" => {
+                // RMS of ~0.25 or more fills the meter. Typical speech sits well below that.
+                let scale = |v: &Value| (v.as_f64().unwrap_or(0.0) * 400.0).min(100.0) as u64;
+                push_hist(&mut self.mic_hist, scale(&ev["mic"]));
+                push_hist(&mut self.out_hist, scale(&ev["out"]));
             }
             "bye" => self.quit = true,
             "models" => {
@@ -611,6 +621,13 @@ impl App {
     }
 }
 
+fn push_hist(h: &mut Vec<u64>, v: u64) {
+    h.push(v);
+    if h.len() > 240 {
+        h.remove(0);
+    }
+}
+
 // ---- drawing ----
 
 fn rows_of(width: usize, cols: u16) -> u16 {
@@ -680,6 +697,21 @@ fn status_word(s: &str) -> (&str, Color) {
         "cancelled" => ("cancelled", t.muted),
         other => (other, t.fg),
     }
+}
+
+fn draw_levels(f: &mut Frame, area: Rect, mic: &[u64], out: &[u64], t: &Theme) {
+    let block = panel("levels", t.border, t);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [mic_row, out_row] = Layout::vertical([Constraint::Length(2), Constraint::Length(2)]).areas(inner);
+    let width = inner.width.saturating_sub(7) as usize;
+    let tail = |h: &[u64]| -> Vec<u64> { h.iter().rev().take(width).rev().copied().collect() };
+    let [mic_label, mic_spark] = Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).areas(mic_row);
+    f.render_widget(Paragraph::new("mic    ").style(Style::new().fg(t.dim)), mic_label);
+    f.render_widget(Sparkline::default().data(&tail(mic)).max(100).style(Style::new().fg(t.good)), mic_spark);
+    let [out_label, out_spark] = Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).areas(out_row);
+    f.render_widget(Paragraph::new("speak  ").style(Style::new().fg(t.dim)), out_label);
+    f.render_widget(Sparkline::default().data(&tail(out)).max(100).style(Style::new().fg(t.special)), out_spark);
 }
 
 impl App {
@@ -768,10 +800,12 @@ impl App {
             .collect();
         pane(f, left, "conversation", says, conv_border, &t);
 
-        let [task_list, log] = if self.log_open {
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right)
+        let (task_list, log, levels) = if self.log_open {
+            let [a, b, c] = Layout::vertical([Constraint::Min(3), Constraint::Percentage(35), Constraint::Length(5)]).areas(right);
+            (a, b, c)
         } else {
-            [right, Rect::default()]
+            let [a, c] = Layout::vertical([Constraint::Min(3), Constraint::Length(5)]).areas(right);
+            (a, Rect::default(), c)
         };
         let task_border = if self.focus == Focus::Tasks {
             t.warn
@@ -802,6 +836,7 @@ impl App {
             ]));
         }
         pane(f, task_list, "tasks", task_lines, task_border, &t);
+        draw_levels(f, levels, &self.mic_hist, &self.out_hist, &t);
         if self.log_open {
             if let Some(task) = self.tasks.get(self.sel_task) {
                 let lines: Vec<Line> = task

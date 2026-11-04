@@ -249,7 +249,10 @@ pub async fn run(
             Some(ev) = in_rx.recv() => {
                 if core.on_in(ev) { break }
             }
-            _ = tick.tick() => core.emit_status(),
+            _ = tick.tick() => {
+                core.emit_status();
+                core.emit_levels();
+            }
         }
     }
     core.emit(json!({"t": "bye"}));
@@ -314,6 +317,11 @@ impl Core {
     fn close(&mut self) {
         self.open = false;
         self.emit(json!({"t": "close"}));
+    }
+
+    fn emit_levels(&self) {
+        let (mic, out) = crate::audio::LEVELS.lock().map(|l| *l).unwrap_or((0.0, 0.0));
+        self.emit(json!({"t": "levels", "mic": mic, "out": out}));
     }
 
     fn emit_status(&mut self) {
