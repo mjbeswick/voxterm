@@ -33,6 +33,10 @@ pub struct Settings {
 
 #[derive(Debug)]
 pub enum LiveCmd {
+    /// Disconnect and wait. Used for the idle sleep.
+    Pause,
+    /// Connect again after a pause.
+    Resume,
     Audio(Vec<i16>),
     Text(String),
     ToolResult {
@@ -174,7 +178,7 @@ fn encode(cmd: &LiveCmd) -> Option<Value> {
         LiveCmd::ToolResult { id, name, result } => {
             json!({"toolResponse": {"functionResponses": [{"id": id, "name": name, "response": {"result": result}}]}})
         }
-        LiveCmd::Reconfigure(_) => return None,
+        LiveCmd::Reconfigure(_) | LiveCmd::Pause | LiveCmd::Resume => return None,
     })
 }
 
@@ -254,11 +258,26 @@ pub async fn run(
     mut cmds: mpsc::UnboundedReceiver<LiveCmd>,
     events: mpsc::UnboundedSender<LiveEvent>,
 ) {
+    let mut paused = false;
     loop {
+        if paused {
+            // Asleep: nothing connects until a resume. Settings changes are kept for the next connect.
+            match cmds.recv().await {
+                None => return,
+                Some(LiveCmd::Resume) => paused = false,
+                Some(LiveCmd::Reconfigure(next)) => settings = next,
+                Some(_) => {}
+            }
+            continue;
+        }
         let _ = events.send(LiveEvent::Status("live: connecting".into()));
         match session(&key, &settings, &mut cmds, &events).await {
-            Ok(Some(next)) => settings = next,
-            Ok(None) => return,
+            Ok(Outcome::Next(next)) => settings = next,
+            Ok(Outcome::Pause) => {
+                paused = true;
+                let _ = events.send(LiveEvent::Status("live: asleep".into()));
+            }
+            Ok(Outcome::Quit) => return,
             Err(e) => {
                 let _ = events.send(LiveEvent::Status(format!("live: {e}; retrying")));
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -267,12 +286,19 @@ pub async fn run(
     }
 }
 
+/// How a connected session ended.
+enum Outcome {
+    Quit,
+    Next(Settings),
+    Pause,
+}
+
 async fn session(
     key: &str,
     s: &Settings,
     cmds: &mut mpsc::UnboundedReceiver<LiveCmd>,
     events: &mpsc::UnboundedSender<LiveEvent>,
-) -> Result<Option<Settings>> {
+) -> Result<Outcome> {
     let ws = connect(key, s).await?;
     let _ = events.send(LiveEvent::Status(format!(
         "live: {} / {}",
@@ -293,8 +319,10 @@ async fn session(
                 None => return Err(anyhow!("connection closed")),
             },
             c = cmds.recv() => match c {
-                None => return Ok(None),
-                Some(LiveCmd::Reconfigure(next)) => return Ok(Some(next)),
+                None => return Ok(Outcome::Quit),
+                Some(LiveCmd::Pause) => return Ok(Outcome::Pause),
+                Some(LiveCmd::Resume) => {}
+                Some(LiveCmd::Reconfigure(next)) => return Ok(Outcome::Next(next)),
                 Some(cmd) => {
                     if let Some(v) = encode(&cmd) {
                         tx.send(Message::Text(v.to_string().into())).await?;

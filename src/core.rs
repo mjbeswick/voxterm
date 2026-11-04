@@ -31,6 +31,9 @@ pub struct Config {
     pub echo_gate: Option<bool>,
     pub echo_tail_ms: u64,
     pub mic_min_rms: f32,
+    /// Minutes without conversation or tasks before the voice session sleeps. 0 means never.
+    #[serde(default = "default_idle")]
+    pub idle_timeout_min: u32,
     /// Speech speed factor. 1.0 is normal.
     #[serde(default = "default_speed")]
     pub speech_rate: f32,
@@ -50,6 +53,7 @@ impl Default for Config {
             echo_tail_ms: 600,
             mic_min_rms: 0.0,
             speech_rate: 1.0,
+            idle_timeout_min: 10,
             style: "hal".into(),
         }
     }
@@ -133,6 +137,9 @@ pub struct Core {
     manual_mute: bool,
     focused: bool,
     last_audio: Option<Instant>,
+    /// Last conversation or interaction. Drives the idle sleep.
+    last_activity: Instant,
+    asleep: bool,
     last_status: String,
     last_tasks: String,
     live_models: Vec<String>,
@@ -267,6 +274,8 @@ pub async fn run(
         manual_mute: false,
         focused: true,
         last_audio: None,
+        last_activity: Instant::now(),
+        asleep: false,
         last_status: String::new(),
         last_tasks: String::new(),
         live_models: vec![],
@@ -287,6 +296,7 @@ pub async fn run(
                 core.emit_levels();
                 core.progress_updates();
                 core.flush_notes();
+                core.check_sleep();
             }
         }
     }
@@ -307,6 +317,10 @@ fn forward<T: Send + 'static>(
             }
         }
     });
+}
+
+fn default_idle() -> u32 {
+    10
 }
 
 fn default_speed() -> f32 {
@@ -336,7 +350,9 @@ impl Core {
     }
 
     fn apply_mic(&self) {
-        let _ = self.audio.send(AudioCmd::Mic(self.mic_wanted()));
+        let _ = self
+            .audio
+            .send(AudioCmd::Mic(self.mic_wanted() && !self.asleep));
     }
 
     fn reconfigure(&self) {
@@ -348,6 +364,7 @@ impl Core {
     /// Adds transcript text. A streamed chunk (`cont`) appends to the open entry of the same
     /// speaker, even when the other speaker has spoken in between.
     fn say(&mut self, who: &str, text: &str, cont: bool) {
+        self.last_activity = Instant::now();
         if who == "asst" {
             if self.suppress_asst || looks_like_tool_text(text) {
                 self.suppress_asst = true;
@@ -433,13 +450,55 @@ impl Core {
         self.emit(json!({"t": "levels", "mic": mic, "out": out}));
     }
 
+    /// Sleeps the voice session after the idle timeout, unless tasks are running.
+    fn check_sleep(&mut self) {
+        let minutes = self.cfg.idle_timeout_min;
+        if self.asleep || minutes == 0 {
+            return;
+        }
+        if self.last_activity.elapsed() < Duration::from_secs(u64::from(minutes) * 60) {
+            return;
+        }
+        if self
+            .tasks
+            .iter()
+            .any(|t| matches!(t.status, "starting" | "running" | "needs_approval"))
+        {
+            return;
+        }
+        self.asleep = true;
+        let _ = self.live_tx.send(LiveCmd::Pause);
+        let _ = self.audio.send(AudioCmd::Mic(false));
+        self.say(
+            "sys",
+            "Asleep after a quiet spell. Switch back to this window, or press ctrl-r, to wake me.",
+            false,
+        );
+        self.emit_status();
+    }
+
+    /// Wakes a sleeping session: reconnects Live and restores the microphone.
+    fn wake(&mut self) {
+        if !self.asleep {
+            return;
+        }
+        self.asleep = false;
+        self.last_activity = Instant::now();
+        let _ = self.live_tx.send(LiveCmd::Resume);
+        self.apply_mic();
+        self.say("sys", "Awake.", false);
+        self.emit_status();
+    }
+
     fn emit_status(&mut self) {
         let live_up =
             self.live_status.starts_with("live: ") && !self.live_status.contains("retrying");
         let speaking = self
             .last_audio
             .is_some_and(|t| t.elapsed() < Duration::from_millis(800));
-        let state = if self.live_status.contains("retrying") {
+        let state = if self.asleep {
+            "asleep"
+        } else if self.live_status.contains("retrying") {
             "retrying"
         } else if speaking {
             "speaking"
@@ -458,6 +517,7 @@ impl Core {
             "voice": self.cfg.voice,
             "live_model": self.cfg.live_model,
             "tasks_ready": self.worker.is_some(),
+            "idle_timeout": self.cfg.idle_timeout_min,
             "style": self.cfg.style,
             "speed": self.cfg.speech_rate,
         });
@@ -829,6 +889,7 @@ impl Core {
             }
             LiveEvent::Audio(s) => {
                 self.last_audio = Some(Instant::now());
+                self.last_activity = Instant::now();
                 let _ = self.audio.send(AudioCmd::Play(s));
             }
             LiveEvent::User(t) => self.say("you", &t, true),
@@ -1097,9 +1158,25 @@ impl Core {
 
     fn on_command(&mut self, v: Value) -> bool {
         let c = v["c"].as_str().unwrap_or_default();
+        self.last_activity = Instant::now();
         match c {
+            "wake" => self.wake(),
+            "idle_timeout" => {
+                if let Some(m) = v["minutes"].as_u64() {
+                    self.cfg.idle_timeout_min = m as u32;
+                    self.cfg.save();
+                    let msg = if m == 0 {
+                        "sleep timeout: off".to_string()
+                    } else {
+                        format!("sleep after {m} minutes without conversation")
+                    };
+                    self.say("sys", &msg, false);
+                    self.emit_status();
+                }
+            }
             "say" => {
                 if let Some(text) = v["text"].as_str().filter(|t| !t.trim().is_empty()) {
+                    self.wake();
                     self.say("you", text, false);
                     let _ = self.live_tx.send(LiveCmd::Text(text.to_string()));
                 }
@@ -1134,6 +1211,9 @@ impl Core {
             }
             "focus" => {
                 self.focused = v["on"].as_bool().unwrap_or(true);
+                if self.focused {
+                    self.wake();
+                }
                 self.apply_mic();
                 self.emit_status();
             }

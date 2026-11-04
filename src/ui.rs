@@ -47,6 +47,7 @@ enum PickKind {
     Theme,
     Style,
     Speed,
+    Idle,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +66,8 @@ enum Action {
     ClearFinished,
     NextTheme,
     ToggleStyle,
+    Idle,
+    Wake,
     CopyConversation,
     ShowMemory,
     Speed,
@@ -98,6 +101,7 @@ struct Status {
     tasks_ready: bool,
     style: String,
     speed: f32,
+    idle_timeout: u32,
 }
 
 struct Picker {
@@ -254,6 +258,7 @@ impl App {
                     tasks_ready: ev["tasks_ready"].as_bool().unwrap_or(false),
                     style: ev["style"].as_str().unwrap_or("plain").to_string(),
                     speed: ev["speed"].as_f64().unwrap_or(1.0) as f32,
+                    idle_timeout: ev["idle_timeout"].as_u64().unwrap_or(10) as u32,
                 };
             }
             "tasks" => {
@@ -300,6 +305,28 @@ impl App {
     }
 
     fn open_picker(&mut self, kind: PickKind) {
+        if kind == PickKind::Idle {
+            let choices = [0u32, 2, 5, 10, 30];
+            let current = self.status.idle_timeout;
+            self.picker = Some(Picker {
+                kind,
+                title: "sleep after",
+                items: choices
+                    .iter()
+                    .map(|m| {
+                        let label = if *m == 0 {
+                            "never".to_string()
+                        } else {
+                            format!("{m} min")
+                        };
+                        (m.to_string(), label)
+                    })
+                    .collect(),
+                sel: choices.iter().position(|m| *m == current).unwrap_or(3),
+                origin_theme: self.theme,
+            });
+            return;
+        }
         if kind == PickKind::Speed {
             let speeds = [0.8f32, 0.9, 1.0, 1.1, 1.25, 1.5];
             let current = self.status.speed;
@@ -349,7 +376,7 @@ impl App {
             return;
         }
         match kind {
-            PickKind::Theme | PickKind::Style | PickKind::Speed => {}
+            PickKind::Theme | PickKind::Style | PickKind::Speed | PickKind::Idle => {}
             PickKind::Voice => {
                 let sel = VOICES
                     .iter()
@@ -414,6 +441,11 @@ impl App {
             PickKind::Task => self.send(json!({"c": "task_model", "value": value})),
             PickKind::Theme => self.set_theme(&value),
             PickKind::Style => self.send(json!({"c": "style", "name": value})),
+            PickKind::Idle => {
+                if let Ok(m) = value.parse::<u64>() {
+                    self.send(json!({"c": "idle_timeout", "minutes": m}));
+                }
+            }
             PickKind::Speed => {
                 if let Ok(v) = value.parse::<f64>() {
                     self.send(json!({"c": "speed", "value": v}));
@@ -443,6 +475,8 @@ impl App {
             ("Theme: pick", "/theme", Action::NextTheme),
             ("Voice style: pick", "/style", Action::ToggleStyle),
             ("Speech speed: pick", "/speed", Action::Speed),
+            ("Sleep timeout: pick", "/sleep", Action::Idle),
+            ("Wake the voice", "ctrl-r", Action::Wake),
             ("Cancel selected task", "ctrl-c", Action::CancelSelected),
             ("Cancel all tasks", "/cancel-all", Action::CancelAll),
             ("Clear finished tasks", "/clear", Action::ClearFinished),
@@ -475,6 +509,8 @@ impl App {
             Action::CopyConversation => self.copy_conversation(),
             Action::ShowMemory => self.send(json!({"c": "memory"})),
             Action::Speed => self.open_picker(PickKind::Speed),
+            Action::Idle => self.open_picker(PickKind::Idle),
+            Action::Wake => self.send(json!({"c": "wake"})),
             Action::Quit => self.send(json!({"c": "quit"})),
         }
     }
@@ -582,6 +618,7 @@ impl App {
             "/theme" => return self.open_picker(PickKind::Theme),
             "/style" => return self.open_picker(PickKind::Style),
             "/speed" => return self.open_picker(PickKind::Speed),
+            "/sleep" => return self.open_picker(PickKind::Idle),
             "/memory" => return self.send(json!({"c": "memory"})),
             "/help" => {
                 return self.palette = Some(Palette {
@@ -802,6 +839,7 @@ impl App {
                         slash: false,
                     });
                 }
+                KeyCode::Char('r') => return self.send(json!({"c": "wake"})),
                 KeyCode::Char('t') => {
                     return self.send(json!({"c": "mute", "on": self.status.mic}));
                 }
@@ -933,15 +971,21 @@ fn key_spans(key: &str, bg: Option<Color>, t: &Theme) -> Vec<Span<'static>> {
     vec![Span::styled(key.to_string(), base)]
 }
 
-/// Markdown for the conversation: headings, bullets, fenced code, **bold**, *italic*, and `code`.
+/// Markdown for the conversation: headings, lists, quotes, rules, tables, fenced code,
+/// **bold**, *italic*, ~~strike~~, `code`, and [links](url).
 fn markdown_lines(text: &str, t: &Theme) -> Vec<Line<'static>> {
     let base = Style::new().fg(t.good);
+    let raw_lines: Vec<&str> = text.split('\n').collect();
     let mut out = Vec::new();
     let mut in_code = false;
-    for raw in text.split('\n') {
+    let mut i = 0;
+    while i < raw_lines.len() {
+        let raw = raw_lines[i];
         let trimmed = raw.trim_start();
+
         if trimmed.starts_with("```") {
             in_code = !in_code;
+            i += 1;
             continue;
         }
         if in_code {
@@ -949,45 +993,143 @@ fn markdown_lines(text: &str, t: &Theme) -> Vec<Line<'static>> {
                 format!("  {raw}"),
                 Style::new().fg(t.special).bg(t.header_bg),
             ));
+            i += 1;
             continue;
         }
-        if let Some(h) = trimmed.strip_prefix('#') {
-            let h = h.trim_start_matches('#').trim();
+
+        // Tables: a row of pipes, then a separator row like |---|---|.
+        if trimmed.starts_with('|') && i + 1 < raw_lines.len() && is_table_rule(raw_lines[i + 1]) {
+            let mut rows = vec![split_row(trimmed)];
+            let mut j = i + 2;
+            while j < raw_lines.len() && raw_lines[j].trim_start().starts_with('|') {
+                rows.push(split_row(raw_lines[j].trim_start()));
+                j += 1;
+            }
+            out.extend(table_lines(&rows, t));
+            i = j;
+            continue;
+        }
+
+        if is_rule(trimmed) {
+            out.push(Line::styled("─".repeat(24), Style::new().fg(t.border)));
+        } else if let Some(h) = heading(trimmed) {
             out.push(Line::styled(
                 h.to_string(),
                 Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
             ));
-            continue;
-        }
-        if let Some(item) = trimmed
+        } else if let Some(q) = trimmed.strip_prefix("> ") {
+            let mut spans = vec![Span::styled("▎ ", Style::new().fg(t.border))];
+            spans.extend(inline_spans(
+                q,
+                Style::new().fg(t.dim).add_modifier(Modifier::ITALIC),
+                t,
+            ));
+            out.push(Line::from(spans));
+        } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
         {
-            let mut spans = vec![Span::styled("  • ".to_string(), Style::new().fg(t.accent))];
+            let mut spans = vec![Span::styled("  • ", Style::new().fg(t.accent))];
             spans.extend(inline_spans(item, base, t));
             out.push(Line::from(spans));
-            continue;
+        } else if let Some((num, item)) = numbered(trimmed) {
+            let mut spans = vec![Span::styled(
+                format!("  {num}. "),
+                Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+            )];
+            spans.extend(inline_spans(item, base, t));
+            out.push(Line::from(spans));
+        } else {
+            out.push(Line::from(inline_spans(raw, base, t)));
         }
-        out.push(Line::from(inline_spans(raw, base, t)));
+        i += 1;
     }
     out
 }
 
-/// Inline markdown: **bold**, *italic*, and `code`, with markers removed.
+fn heading(line: &str) -> Option<&str> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) && line[hashes..].starts_with(' ') {
+        Some(line[hashes..].trim())
+    } else {
+        None
+    }
+}
+
+fn is_rule(line: &str) -> bool {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.len() >= 3 && (compact.chars().all(|c| c == '-') || compact.chars().all(|c| c == '*'))
+}
+
+fn numbered(line: &str) -> Option<(&str, &str)> {
+    let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &line[digits..];
+    rest.strip_prefix(". ").map(|item| (&line[..digits], item))
+}
+
+fn is_table_rule(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+fn split_row(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|c| c.trim().to_string())
+        .collect()
+}
+
+/// A table with aligned columns. The first row is the header.
+fn table_lines(rows: &[Vec<String>], t: &Theme) -> Vec<Line<'static>> {
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; cols];
+    for r in rows {
+        for (c, cell) in r.iter().enumerate() {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+    let mut out = Vec::new();
+    for (ri, r) in rows.iter().enumerate() {
+        let mut spans = vec![Span::styled("│ ", Style::new().fg(t.border))];
+        for c in 0..cols {
+            let cell = r.get(c).cloned().unwrap_or_default();
+            let pad = widths[c] - cell.chars().count();
+            let style = if ri == 0 {
+                Style::new().fg(t.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(t.good)
+            };
+            spans.push(Span::styled(format!("{cell}{}", " ".repeat(pad)), style));
+            spans.push(Span::styled(" │ ", Style::new().fg(t.border)));
+        }
+        out.push(Line::from(spans));
+        if ri == 0 {
+            let rule: String = widths
+                .iter()
+                .map(|w| "─".repeat(w + 2))
+                .collect::<Vec<_>>()
+                .join("┼");
+            out.push(Line::styled(format!("├{rule}┤"), Style::new().fg(t.border)));
+        }
+    }
+    out
+}
+
+/// Inline markdown: **bold**, *italic*, ~~strike~~, `code`, and [links](url). Markers are removed.
 fn inline_spans(text: &str, base: Style, t: &Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut buf = String::new();
     let mut bold = false;
     let mut italic = false;
+    let mut strike = false;
     let mut code = false;
     let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    let flush = |buf: &mut String, spans: &mut Vec<Span<'static>>, style: Style| {
-        if !buf.is_empty() {
-            spans.push(Span::styled(std::mem::take(buf), style));
-        }
-    };
-    let style_now = |bold: bool, italic: bool, code: bool| {
+    let style_now = |bold: bool, italic: bool, strike: bool, code: bool| {
         let mut st = base;
         if bold {
             st = st.add_modifier(Modifier::BOLD);
@@ -995,29 +1137,82 @@ fn inline_spans(text: &str, base: Style, t: &Theme) -> Vec<Span<'static>> {
         if italic {
             st = st.add_modifier(Modifier::ITALIC);
         }
+        if strike {
+            st = st.add_modifier(Modifier::CROSSED_OUT);
+        }
         if code {
             st = st.fg(t.special).bg(t.header_bg);
         }
         st
     };
+    let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        // Links: [text](url) shows the text, underlined in the accent colour.
+        if !code && c == '[' {
+            if let Some(close) = chars[i..].iter().position(|x| *x == ']') {
+                let end = i + close;
+                if chars.get(end + 1) == Some(&'(') {
+                    if let Some(paren) = chars[end + 1..].iter().position(|x| *x == ')') {
+                        if !buf.is_empty() {
+                            spans.push(Span::styled(
+                                std::mem::take(&mut buf),
+                                style_now(bold, italic, strike, code),
+                            ));
+                        }
+                        let label: String = chars[i + 1..end].iter().collect();
+                        spans.push(Span::styled(
+                            label,
+                            Style::new().fg(t.accent).add_modifier(Modifier::UNDERLINED),
+                        ));
+                        i = end + 1 + paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
         if c == '`' {
-            flush(&mut buf, &mut spans, style_now(bold, italic, code));
+            if !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    style_now(bold, italic, strike, code),
+                ));
+            }
             code = !code;
+        } else if !code && c == '~' && chars.get(i + 1) == Some(&'~') {
+            if !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    style_now(bold, italic, strike, code),
+                ));
+            }
+            strike = !strike;
+            i += 1;
         } else if !code && c == '*' && chars.get(i + 1) == Some(&'*') {
-            flush(&mut buf, &mut spans, style_now(bold, italic, code));
+            if !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    style_now(bold, italic, strike, code),
+                ));
+            }
             bold = !bold;
             i += 1;
         } else if !code && c == '*' {
-            flush(&mut buf, &mut spans, style_now(bold, italic, code));
+            if !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    style_now(bold, italic, strike, code),
+                ));
+            }
             italic = !italic;
         } else {
             buf.push(c);
         }
         i += 1;
     }
-    flush(&mut buf, &mut spans, style_now(bold, italic, code));
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, style_now(bold, italic, strike, code)));
+    }
     spans
 }
 
@@ -1092,6 +1287,7 @@ fn state_style(state: &str, t: &Theme) -> (&'static str, Color) {
         "speaking" => ("SPEAKING", t.special),
         "muted" => ("MUTED", t.warn),
         "retrying" => ("RETRYING", t.bad),
+        "asleep" => ("ASLEEP", t.muted),
         _ => ("CONNECTING", t.accent),
     }
 }
@@ -1598,5 +1794,35 @@ mod markdown_tests {
         assert!(text[1].contains("• item"));
         assert!(text[2].contains("let x = 1;"));
         assert_eq!(text.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod markdown_rich_tests {
+    use super::*;
+
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(|l| l.to_string()).collect()
+    }
+
+    #[test]
+    fn table_has_header_rule_and_aligned_cells() {
+        let t = THEMES[0];
+        let text = "| Fruit | Qty |\n|---|---|\n| Apple | 3 |\n| Kiwi | 12 |";
+        let lines = plain(&markdown_lines(text, &t));
+        assert!(lines[0].contains("Fruit") && lines[0].contains("Qty"));
+        assert!(lines[1].starts_with("├"));
+        assert!(lines[3].contains("Kiwi") && lines[3].contains("12"));
+    }
+
+    #[test]
+    fn numbered_quote_rule_and_links_render() {
+        let t = THEMES[0];
+        let text = "1. first\n> quoted\n---\nsee [docs](https://x.y) and ~~old~~";
+        let lines = plain(&markdown_lines(text, &t));
+        assert!(lines[0].contains("1. first"));
+        assert!(lines[1].contains("▎ quoted"));
+        assert!(lines[2].starts_with("────"));
+        assert!(lines[3].contains("see docs and old"));
     }
 }
